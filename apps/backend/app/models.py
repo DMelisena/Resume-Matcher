@@ -32,6 +32,13 @@ def _utcnow_iso() -> str:
 class Base(DeclarativeBase):
     """Declarative base shared by every table."""
 
+class User(Base):
+    __tablename__ = "users"
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    email: Mapped[str] = mapped_column(String, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String)
+    created_at: Mapped[str] = mapped_column(String, default=_utcnow_iso)
+
 
 class Resume(Base):
     """A resume document (master or tailored), owned by one account."""
