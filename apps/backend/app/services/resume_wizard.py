@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.config_cache import get_content_language
-from app.llm import _scrub_secrets, complete_json
+from app.llm import LLMConfig, _scrub_secrets, complete_json
 from app.prompts.resume_wizard import RESUME_WIZARD_TURN_PROMPT
 from app.prompts.templates import get_language_name
 from app.services.improver import _sanitize_user_input
@@ -335,6 +335,7 @@ def _next_question(result: dict[str, Any], data: ResumeData) -> ResumeWizardQues
 
 
 async def run_ai_turn(
+    llm_config: LLMConfig,
     state: ResumeWizardState,
     answer_text: str,
     *,
@@ -357,7 +358,7 @@ async def run_ai_turn(
         resume_json=resume_json,
         answer_text=prompt_answer,
     )
-    result = await complete_json(prompt, max_tokens=8192, schema_type="resume")
+    result = await complete_json(prompt, config=llm_config, max_tokens=8192, schema_type="resume")
     if not isinstance(result, dict):
         raise ValueError("Resume wizard LLM response must be a JSON object.")
 

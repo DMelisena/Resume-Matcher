@@ -20,6 +20,7 @@ from app.database import db
 from app.pdf import close_pdf_renderer, init_pdf_renderer
 from app.routers import (
     applications_router,
+    auth_router,
     config_router,
     enrichment_router,
     health_router,
@@ -43,13 +44,12 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager."""
     # Startup
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    # Import a legacy TinyDB database into SQLite if present (idempotent).
-    # Fail-fast on error: starting with an empty DB would look like data loss.
-    from app.scripts.migrate_tinydb_to_sqlite import migrate as migrate_tinydb
-
-    result = await migrate_tinydb()
-    if result.get("status") == "migrated":
-        logger.info("Startup data migration: %s", result)
+    # NOTE: the legacy TinyDB->SQLite startup migration was removed when the
+    # primary data store moved to Supabase Postgres. A one-time, operator-run
+    # backfill (SQLite -> Supabase Postgres, per-account) lives in
+    # app/scripts/migrate_sqlite_to_supabase.py — see docs/agent/features/
+    # supabase-auth-migration.md for the deployment runbook. It is
+    # intentionally NOT run automatically on every boot.
     # Fold any legacy plaintext API keys into the encrypted store (idempotent,
     # non-clobbering), then strip them from config.json.
     from app.config import migrate_legacy_keys
@@ -94,6 +94,7 @@ app.include_router(jobs_router, prefix="/api/v1")
 app.include_router(enrichment_router, prefix="/api/v1")
 app.include_router(applications_router, prefix="/api/v1")
 app.include_router(resume_wizard_router, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1")
 
 
 @app.get("/")

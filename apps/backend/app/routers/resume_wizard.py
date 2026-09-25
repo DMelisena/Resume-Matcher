@@ -4,9 +4,11 @@ import json
 import logging
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.auth import get_current_user_id
 from app.database import db
+from app.llm import get_llm_config
 from app.schemas.models import ResumeData, normalize_resume_data
 from app.schemas.resume_wizard import (
     ResumeWizardFinalizeRequest,
@@ -30,6 +32,7 @@ router = APIRouter(prefix="/resume-wizard", tags=["Resume Wizard"])
 @router.post("/turn", response_model=ResumeWizardTurnResponse)
 async def resume_wizard_turn(
     request: ResumeWizardTurnRequest,
+    user_id: str = Depends(get_current_user_id),
 ) -> ResumeWizardTurnResponse:
     """Advance the resume wizard by one structured turn."""
     try:
@@ -46,12 +49,13 @@ async def resume_wizard_turn(
         if request.state.asked_count >= RESUME_WIZARD_MAX_QUESTIONS:
             return ResumeWizardTurnResponse(state=apply_review(request.state))
 
+        llm_config = get_llm_config(user_id)
         if action == "skip":
-            state = await run_ai_turn(request.state, "", skip=True)
+            state = await run_ai_turn(llm_config, request.state, "", skip=True)
             return ResumeWizardTurnResponse(state=state)
 
         answer_text = request.answer.text if request.answer else ""
-        state = await run_ai_turn(request.state, answer_text, skip=False)
+        state = await run_ai_turn(llm_config, request.state, answer_text, skip=False)
         return ResumeWizardTurnResponse(state=state)
     except HTTPException:
         raise
@@ -69,10 +73,11 @@ async def resume_wizard_turn(
 @router.post("/finalize", response_model=ResumeWizardFinalizeResponse)
 async def finalize_resume_wizard(
     request: ResumeWizardFinalizeRequest,
+    user_id: str = Depends(get_current_user_id),
 ) -> ResumeWizardFinalizeResponse:
-    """Create the master resume from a validated wizard draft."""
+    """Create the caller's master resume from a validated wizard draft."""
     try:
-        current_master = await db.get_master_resume()
+        current_master = await db.get_master_resume(user_id)
         if current_master and current_master.get("processing_status") == "ready":
             raise HTTPException(
                 status_code=409,
@@ -89,6 +94,7 @@ async def finalize_resume_wizard(
         # Set the title in the atomic create so a separate update can't fail and
         # leave a committed-but-untitled master behind (which would 409 on retry).
         resume = await db.create_resume_atomic_master(
+            user_id=user_id,
             content=content,
             content_type="json",
             filename=f"AI Resume Wizard - {name}.json",
@@ -98,7 +104,7 @@ async def finalize_resume_wizard(
         )
         if not resume.get("is_master", False):
             try:
-                await db.delete_resume(resume["resume_id"])
+                await db.delete_resume(user_id, resume["resume_id"])
             except Exception as e:
                 logger.error(
                     "Failed to clean up non-master wizard resume %s: %s",

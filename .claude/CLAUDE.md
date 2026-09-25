@@ -113,6 +113,7 @@ apps/
 ### For Features
 | Feature | Documentation |
 |---------|---------------|
+| Auth (Supabase, per-account data + RLS) | [supabase-auth-migration.md](../docs/agent/features/supabase-auth-migration.md) |
 | Application tracker | [application-tracker.md](../docs/agent/features/application-tracker.md) |
 | Custom sections | [custom-sections.md](../docs/agent/features/custom-sections.md) |
 | Resume templates | [resume-templates.md](../docs/agent/features/resume-templates.md) |

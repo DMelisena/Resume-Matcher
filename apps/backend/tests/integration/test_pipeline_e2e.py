@@ -28,25 +28,27 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.auth import get_current_user_id
 from app.main import app
 from app.schemas.models import ResumeData
 
 
-def _new_client():
-    """A fresh ASGI-in-process client.
+def _new_client(user_id):
+    """A fresh ASGI-in-process client, authenticated as `user_id`.
 
     httpx.AsyncClient cannot be reopened once its ``async with`` block exits, so
     multi-request flows construct one client per request rather than reusing a
     single fixture instance.
     """
+    app.dependency_overrides[get_current_user_id] = lambda: user_id
     transport = ASGITransport(app=app)
     return AsyncClient(transport=transport, base_url="http://test")
 
 
 @pytest.fixture
-def client():
+def client(isolated_db):
     """Async HTTP client bound to the real FastAPI app (ASGI in-process)."""
-    return _new_client()
+    return _new_client(isolated_db.user_id)
 
 
 async def _upload_resume(isolated_db, sample_resume):
@@ -70,7 +72,7 @@ async def _upload_resume(isolated_db, sample_resume):
             return_value=copy.deepcopy(sample_resume),
         ),
     ):
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             resp = await client.post(
                 "/api/v1/resumes/upload",
                 files={"file": ("resume.pdf", b"%PDF-1.4 fake", "application/pdf")},
@@ -101,7 +103,7 @@ class TestPipelineCore:
         assert resume_id
 
         # Inspect REAL persisted state via the yielded isolated db.
-        master = await isolated_db.get_master_resume()
+        master = await isolated_db.db.get_master_resume(isolated_db.user_id)
         assert master is not None
         assert master["resume_id"] == resume_id
         assert master["processing_status"] == "ready"
@@ -113,7 +115,7 @@ class TestPipelineCore:
             master["processed_data"]["summary"] == sample_resume["summary"]
         )
         # Exactly one resume exists, and it is the master.
-        assert len(await isolated_db.list_resumes()) == 1
+        assert len(await isolated_db.db.list_resumes(isolated_db.user_id)) == 1
 
     async def test_jobs_upload_persists_job_through_router(
         self, isolated_db, client
@@ -146,10 +148,10 @@ class TestPipelineCore:
         job_id = job_ids[0]
 
         # Real persistence check via the yielded db.
-        stored_job = await isolated_db.get_job(job_id)
+        stored_job = await isolated_db.db.get_job(isolated_db.user_id, job_id)
         assert stored_job is not None
         assert "FastAPI" in stored_job["content"]
-        assert (await isolated_db.get_stats())["total_jobs"] == 1
+        assert (await isolated_db.db.get_stats(isolated_db.user_id))["total_jobs"] == 1
 
     async def test_full_journey_upload_jobs_then_fetch(
         self, isolated_db, sample_resume
@@ -168,21 +170,21 @@ class TestPipelineCore:
         resume_id = upload_resp.json()["resume_id"]
 
         # The resume_id is recoverable from the db too (anti-theater).
-        listed = await isolated_db.list_resumes()
+        listed = await isolated_db.db.list_resumes(isolated_db.user_id)
         assert resume_id in {r["resume_id"] for r in listed}
 
         # 2. Jobs upload.
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             jobs_resp = await client.post(
                 "/api/v1/jobs/upload",
                 json={"job_descriptions": ["Senior Python role at TechCorp."]},
             )
         assert jobs_resp.status_code == 200
         job_id = jobs_resp.json()["job_id"][0]
-        assert await isolated_db.get_job(job_id) is not None
+        assert await isolated_db.db.get_job(isolated_db.user_id, job_id) is not None
 
         # 3. Fetch the resume back through the real GET handler.
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             fetch_resp = await client.get(
                 "/api/v1/resumes", params={"resume_id": resume_id}
             )
@@ -196,7 +198,7 @@ class TestPipelineCore:
         assert processed["summary"] == sample_resume["summary"]
 
         # Both resume and job live in the same isolated db.
-        stats = await isolated_db.get_stats()
+        stats = await isolated_db.db.get_stats(isolated_db.user_id)
         assert stats["total_resumes"] == 1
         assert stats["total_jobs"] == 1
         assert stats["has_master_resume"] is True
@@ -209,7 +211,7 @@ class TestPipelineCore:
                 "/api/v1/resumes", params={"resume_id": "does-not-exist"}
             )
         assert resp.status_code == 404
-        assert await isolated_db.list_resumes() == []
+        assert await isolated_db.db.list_resumes(isolated_db.user_id) == []
 
 
 class TestTailoringPipeline:
@@ -238,7 +240,7 @@ class TestTailoringPipeline:
         assert upload_resp.status_code == 200
         resume_id = upload_resp.json()["resume_id"]
 
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             jobs_resp = await client.post(
                 "/api/v1/jobs/upload",
                 json={
@@ -308,7 +310,7 @@ class TestTailoringPipeline:
             ),
         ):
             # --- Preview (no persistence; resume_id stays null) ---
-            async with _new_client() as client:
+            async with _new_client(isolated_db.user_id) as client:
                 preview_resp = await client.post(
                     "/api/v1/resumes/improve/preview",
                     json={"resume_id": resume_id, "job_id": job_id},
@@ -320,13 +322,13 @@ class TestTailoringPipeline:
             preview_resume = preview_data["resume_preview"]
             assert preview_resume["summary"] == improved["summary"]
             # Preview must NOT have persisted a tailored resume.
-            assert (await isolated_db.get_stats())["total_resumes"] == 1
+            assert (await isolated_db.db.get_stats(isolated_db.user_id))["total_resumes"] == 1
             # The preview_hash was persisted on the job for the confirm handshake.
-            job_after_preview = await isolated_db.get_job(job_id)
+            job_after_preview = await isolated_db.db.get_job(isolated_db.user_id, job_id)
             assert job_after_preview.get("preview_hash")
 
             # --- Confirm (echo the preview back, exactly as the client does) ---
-            async with _new_client() as client:
+            async with _new_client(isolated_db.user_id) as client:
                 confirm_resp = await client.post(
                     "/api/v1/resumes/improve/confirm",
                     json={
@@ -345,7 +347,7 @@ class TestTailoringPipeline:
 
         # The tailored resume is REALLY persisted, as a non-master child of the
         # original, carrying the tailored summary.
-        stored_tailored = await isolated_db.get_resume(tailored_id)
+        stored_tailored = await isolated_db.db.get_resume(isolated_db.user_id, tailored_id)
         assert stored_tailored is not None
         assert stored_tailored["is_master"] is False
         assert stored_tailored["parent_id"] == resume_id
@@ -358,16 +360,16 @@ class TestTailoringPipeline:
         )
 
         # An improvements record links original -> tailored for this job.
-        improvement = await isolated_db.get_improvement_by_tailored_resume(tailored_id)
+        improvement = await isolated_db.db.get_improvement_by_tailored_resume(isolated_db.user_id, tailored_id)
         assert improvement is not None
         assert improvement["original_resume_id"] == resume_id
         assert improvement["job_id"] == job_id
 
         # Master + tailored both present; master unchanged.
-        stats = await isolated_db.get_stats()
+        stats = await isolated_db.db.get_stats(isolated_db.user_id)
         assert stats["total_resumes"] == 2
         assert stats["total_improvements"] == 1
-        master = await isolated_db.get_master_resume()
+        master = await isolated_db.db.get_master_resume(isolated_db.user_id)
         assert master["resume_id"] == resume_id
         assert master["processed_data"]["summary"] == sample_resume["summary"]
 
@@ -389,7 +391,7 @@ class TestTailoringPipeline:
         assert upload_resp.status_code == 200
         resume_id = upload_resp.json()["resume_id"]
 
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             jobs_resp = await client.post(
                 "/api/v1/jobs/upload",
                 json={"job_descriptions": ["Senior Backend Engineer: Python, FastAPI."]},
@@ -451,7 +453,7 @@ class TestTailoringPipeline:
                 return_value="Senior Backend Engineer",
             ),
         ):
-            async with _new_client() as client:
+            async with _new_client(isolated_db.user_id) as client:
                 preview_resp = await client.post(
                     "/api/v1/resumes/improve/preview",
                     json={"resume_id": resume_id, "job_id": job_id},
@@ -463,7 +465,7 @@ class TestTailoringPipeline:
             # improved_data wasn't — this asymmetry is what used to break confirm.
             assert "github" in preview_resume["personalProjects"][0]
 
-            async with _new_client() as client:
+            async with _new_client(isolated_db.user_id) as client:
                 confirm_resp = await client.post(
                     "/api/v1/resumes/improve/confirm",
                     json={
@@ -478,7 +480,7 @@ class TestTailoringPipeline:
         # The tailored resume really persisted as a child of the master.
         tailored_id = confirm_resp.json()["data"]["resume_id"]
         assert tailored_id is not None and tailored_id != resume_id
-        assert await isolated_db.get_resume(tailored_id) is not None
+        assert await isolated_db.db.get_resume(isolated_db.user_id, tailored_id) is not None
 
 
 class TestConfigurableImproveTimeout:
@@ -494,7 +496,7 @@ class TestConfigurableImproveTimeout:
 
         # Seed a master resume + a job through the real routers.
         resume_id = (await _upload_resume(isolated_db, sample_resume)).json()["resume_id"]
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             jr = await client.post(
                 "/api/v1/jobs/upload",
                 json={"job_descriptions": ["Senior Python / FastAPI role."]},
@@ -510,7 +512,7 @@ class TestConfigurableImproveTimeout:
 
         monkeypatch.setattr("app.routers.resumes._improve_preview_flow", _slow_flow)
 
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             resp = await client.post(
                 "/api/v1/resumes/improve/preview",
                 json={"resume_id": resume_id, "job_id": job_id},

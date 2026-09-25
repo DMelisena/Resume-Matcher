@@ -437,8 +437,8 @@ def resolve_api_key(stored: dict, provider: str) -> str:
     return api_key
 
 
-def get_llm_config() -> LLMConfig:
-    """Get current LLM configuration.
+def get_llm_config(user_id: str) -> LLMConfig:
+    """Get current LLM configuration for ``user_id``.
 
     Priority for api_key: top-level api_key > api_keys[provider] > env/settings
     Priority for reasoning_effort: config.json > env/settings
@@ -450,7 +450,7 @@ def get_llm_config() -> LLMConfig:
     field explicitly (empty string persisted by the PUT handler) will not
     have it restored.
     """
-    stored = load_config_file()
+    stored = load_config_file(user_id)
     provider = stored.get("provider", settings.llm_provider)
     model = stored.get("model", settings.llm_model)
 
@@ -623,7 +623,10 @@ def get_router(config: LLMConfig | None = None) -> tuple[Router, LLMConfig]:
     global _router, _router_config_key
 
     if config is None:
-        config = get_llm_config()
+        raise ValueError(
+            "get_router() requires an explicit, user-scoped LLMConfig now that "
+            "API keys are per-account; call app.llm.get_llm_config(user_id) first."
+        )
 
     key = _config_fingerprint(config)
     with _router_lock:
@@ -644,7 +647,10 @@ async def check_llm_health(
 ) -> dict[str, Any]:
     """Check if the LLM provider is accessible and working."""
     if config is None:
-        config = get_llm_config()
+        raise ValueError(
+            "check_llm_health() requires an explicit, user-scoped LLMConfig now "
+            "that API keys are per-account; call app.llm.get_llm_config(user_id) first."
+        )
 
     # Check if API key is configured. Ollama and openai_compatible local
     # servers often run without auth, so a blank key is acceptable for those
@@ -763,8 +769,8 @@ async def check_llm_health(
 
 async def complete(
     prompt: str,
+    config: LLMConfig,
     system_prompt: str | None = None,
-    config: LLMConfig | None = None,
     max_tokens: int = 4096,
     temperature: float = 0.7,
 ) -> str:
@@ -1183,8 +1189,8 @@ def _extract_json(content: str, _depth: int = 0) -> str:
 
 async def complete_json(
     prompt: str,
+    config: LLMConfig,
     system_prompt: str | None = None,
-    config: LLMConfig | None = None,
     max_tokens: int = 4096,
     retries: int = 2,
     schema_type: str = "resume",

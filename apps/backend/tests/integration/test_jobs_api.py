@@ -1,17 +1,25 @@
 """Integration tests for job description endpoints."""
 
 from unittest.mock import AsyncMock, patch, MagicMock
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.auth import get_current_user_id
 from app.main import app
+
+TEST_USER_ID = str(uuid4())
 
 
 @pytest.fixture
 def client():
+    app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
     transport = ASGITransport(app=app)
-    return AsyncClient(transport=transport, base_url="http://test")
+    try:
+        yield AsyncClient(transport=transport, base_url="http://test")
+    finally:
+        app.dependency_overrides.pop(get_current_user_id, None)
 
 
 class TestJobUpload:

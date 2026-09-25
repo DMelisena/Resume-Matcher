@@ -7,18 +7,26 @@ guard pins PR #794 (reject image-based / scanned PDFs).
 """
 
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.auth import get_current_user_id
 from app.main import app
 from app.routers.resumes import MAX_FILE_SIZE
+
+TEST_USER_ID = str(uuid4())
 
 
 @pytest.fixture
 def client():
+    app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
     transport = ASGITransport(app=app)
-    return AsyncClient(transport=transport, base_url="http://test")
+    try:
+        yield AsyncClient(transport=transport, base_url="http://test")
+    finally:
+        app.dependency_overrides.pop(get_current_user_id, None)
 
 
 class TestUploadGuards:

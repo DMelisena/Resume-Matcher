@@ -141,14 +141,15 @@ async def parse_document(content: bytes, filename: str) -> str:
         tmp_path.unlink(missing_ok=True)
 
 
-async def parse_resume_to_json(markdown_text: str) -> dict[str, Any]:
-    """Parse resume markdown to structured JSON using LLM.
+async def parse_resume_to_json(user_id: str, markdown_text: str) -> dict[str, Any]:
+    """Parse resume markdown to structured JSON using ``user_id``'s LLM config.
 
     After LLM parsing, patches any year-only dates with month-inclusive
     dates extracted from the raw markdown. This ensures months are never
     lost regardless of LLM behavior.
 
     Args:
+        user_id: Owning account, used to resolve the LLM provider/API key.
         markdown_text: Resume content in markdown format
 
     Returns:
@@ -162,10 +163,11 @@ async def parse_resume_to_json(markdown_text: str) -> dict[str, Any]:
         resume_text=markdown_text,
     )
 
-    config = get_llm_config()
+    config = get_llm_config(user_id)
     model_name = get_model_name(config)
     result = await complete_json(
         prompt=prompt,
+        config=config,
         system_prompt="You are a JSON extraction engine. Output only valid JSON, no explanations.",
         max_tokens=get_safe_max_tokens(model_name),
         retries=3,

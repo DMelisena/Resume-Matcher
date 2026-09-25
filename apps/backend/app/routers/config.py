@@ -4,8 +4,9 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
+from app.auth import get_current_user_id
 from app.config import settings
 from app.llm import check_llm_health, LLMConfig, resolve_api_key
 from app.schemas import (
@@ -69,9 +70,9 @@ def _get_config_path() -> Path:
     return settings.config_path
 
 
-def _load_config() -> dict:
-    """Load config with decrypted API keys injected (so resolve_api_key works)."""
-    return load_config_file()
+def _load_config(user_id: str) -> dict:
+    """Load config with the caller's decrypted API keys injected (so resolve_api_key works)."""
+    return load_config_file(user_id)
 
 
 def _save_config(config: dict) -> None:
@@ -111,9 +112,11 @@ async def _log_llm_health_check(config: LLMConfig) -> None:
 
 
 @router.get("/llm-api-key", response_model=LLMConfigResponse)
-async def get_llm_config_endpoint() -> LLMConfigResponse:
+async def get_llm_config_endpoint(
+    user_id: str = Depends(get_current_user_id),
+) -> LLMConfigResponse:
     """Get current LLM configuration (API key masked)."""
-    stored = _load_config()
+    stored = _load_config(user_id)
 
     provider = stored.get("provider", settings.llm_provider)
     reasoning_effort = stored.get("reasoning_effort", settings.reasoning_effort)
@@ -130,6 +133,7 @@ async def get_llm_config_endpoint() -> LLMConfigResponse:
 async def update_llm_config(
     request: LLMConfigRequest,
     background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
 ) -> LLMConfigResponse:
     """Update LLM configuration.
 
@@ -140,7 +144,7 @@ async def update_llm_config(
     still need to persist the configuration. Connectivity can be verified via
     `/config/llm-test` and the System Status panel.
     """
-    stored = _load_config()
+    stored = _load_config(user_id)
 
     # Update only provided fields
     if request.provider is not None:
@@ -212,13 +216,16 @@ async def update_llm_config(
 
 
 @router.post("/llm-test")
-async def test_llm_connection(request: LLMConfigRequest | None = None) -> dict:
+async def test_llm_connection(
+    request: LLMConfigRequest | None = None,
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
     """Test LLM connection with provided or stored configuration.
 
     If request body is provided, tests with those values (for pre-save testing).
     Otherwise, tests with the currently saved configuration.
     """
-    stored = _load_config()
+    stored = _load_config(user_id)
 
     # Build config: use request values if provided, otherwise fall back to stored/default
     test_provider = (
@@ -255,9 +262,11 @@ async def test_llm_connection(request: LLMConfigRequest | None = None) -> dict:
 
 
 @router.get("/features", response_model=FeatureConfigResponse)
-async def get_feature_config() -> FeatureConfigResponse:
+async def get_feature_config(
+    user_id: str = Depends(get_current_user_id),
+) -> FeatureConfigResponse:
     """Get current feature configuration."""
-    stored = _load_config()
+    stored = _load_config(user_id)
 
     return FeatureConfigResponse(
         enable_cover_letter=stored.get("enable_cover_letter", False),
@@ -267,9 +276,12 @@ async def get_feature_config() -> FeatureConfigResponse:
 
 
 @router.put("/features", response_model=FeatureConfigResponse)
-async def update_feature_config(request: FeatureConfigRequest) -> FeatureConfigResponse:
+async def update_feature_config(
+    request: FeatureConfigRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> FeatureConfigResponse:
     """Update feature configuration."""
-    stored = _load_config()
+    stored = _load_config(user_id)
 
     # Update only provided fields
     if request.enable_cover_letter is not None:
@@ -294,9 +306,11 @@ SUPPORTED_LANGUAGES = ["en", "es", "zh", "ja", "pt", "fr", "ko"]
 
 
 @router.get("/language", response_model=LanguageConfigResponse)
-async def get_language_config() -> LanguageConfigResponse:
+async def get_language_config(
+    user_id: str = Depends(get_current_user_id),
+) -> LanguageConfigResponse:
     """Get current language configuration."""
-    stored = _load_config()
+    stored = _load_config(user_id)
 
     # Support legacy single 'language' field migration
     legacy_language = stored.get("language", "en")
@@ -311,9 +325,10 @@ async def get_language_config() -> LanguageConfigResponse:
 @router.put("/language", response_model=LanguageConfigResponse)
 async def update_language_config(
     request: LanguageConfigRequest,
+    user_id: str = Depends(get_current_user_id),
 ) -> LanguageConfigResponse:
     """Update language configuration."""
-    stored = _load_config()
+    stored = _load_config(user_id)
 
     # Validate and update UI language
     if request.ui_language is not None:
@@ -347,9 +362,11 @@ async def update_language_config(
 
 
 @router.get("/prompts", response_model=PromptConfigResponse)
-async def get_prompt_config() -> PromptConfigResponse:
+async def get_prompt_config(
+    user_id: str = Depends(get_current_user_id),
+) -> PromptConfigResponse:
     """Get current prompt configuration for resume tailoring."""
-    stored = _load_config()
+    stored = _load_config(user_id)
     options = _get_prompt_options()
     option_ids = {option.id for option in options}
     default_prompt_id = stored.get("default_prompt_id", DEFAULT_IMPROVE_PROMPT_ID)
@@ -365,9 +382,10 @@ async def get_prompt_config() -> PromptConfigResponse:
 @router.put("/prompts", response_model=PromptConfigResponse)
 async def update_prompt_config(
     request: PromptConfigRequest,
+    user_id: str = Depends(get_current_user_id),
 ) -> PromptConfigResponse:
     """Update prompt configuration for resume tailoring."""
-    stored = _load_config()
+    stored = _load_config(user_id)
     options = _get_prompt_options()
     option_ids = {option.id for option in options}
 
@@ -395,14 +413,16 @@ async def update_prompt_config(
 
 
 @router.get("/feature-prompts", response_model=FeaturePromptsResponse)
-async def get_feature_prompts() -> FeaturePromptsResponse:
+async def get_feature_prompts(
+    user_id: str = Depends(get_current_user_id),
+) -> FeaturePromptsResponse:
     """Get custom feature prompts (cover letter, outreach message).
 
     Empty strings mean "use default". The ``*_default`` fields expose the
     built-in prompts so the UI can show them as placeholder text without
     duplicating the content client-side.
     """
-    stored = _load_config()
+    stored = _load_config(user_id)
     return FeaturePromptsResponse(
         cover_letter_prompt=stored.get("cover_letter_prompt", "") or "",
         outreach_message_prompt=stored.get("outreach_message_prompt", "") or "",
@@ -414,6 +434,7 @@ async def get_feature_prompts() -> FeaturePromptsResponse:
 @router.put("/feature-prompts", response_model=FeaturePromptsResponse)
 async def update_feature_prompts(
     request: FeaturePromptsRequest,
+    user_id: str = Depends(get_current_user_id),
 ) -> FeaturePromptsResponse:
     """Update custom feature prompts.
 
@@ -424,7 +445,7 @@ async def update_feature_prompts(
     override — persisted as ``""`` so runtime resolution falls back to the
     built-in default.
     """
-    stored = _load_config()
+    stored = _load_config(user_id)
 
     if request.cover_letter_prompt is not None:
         prompt = request.cover_letter_prompt.strip()
@@ -492,13 +513,15 @@ def _mask_key_short(key: str | None) -> str | None:
 
 
 @router.get("/api-keys", response_model=ApiKeyStatusResponse)
-async def get_api_keys_status() -> ApiKeyStatusResponse:
-    """Get status of all configured API keys (masked).
+async def get_api_keys_status(
+    user_id: str = Depends(get_current_user_id),
+) -> ApiKeyStatusResponse:
+    """Get status of all of the caller's configured API keys (masked).
 
     Returns the configuration status for each supported provider.
     API keys are masked to show only the last 4 characters.
     """
-    stored_keys = get_api_keys_from_config()
+    stored_keys = get_api_keys_from_config(user_id)
 
     providers = []
     for provider in SUPPORTED_PROVIDERS:
@@ -515,13 +538,16 @@ async def get_api_keys_status() -> ApiKeyStatusResponse:
 
 
 @router.post("/api-keys", response_model=ApiKeysUpdateResponse)
-async def update_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateResponse:
-    """Update API keys for one or more providers.
+async def update_api_keys(
+    request: ApiKeysUpdateRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> ApiKeysUpdateResponse:
+    """Update the caller's API keys for one or more providers.
 
     Only updates the providers that are explicitly set in the request.
     Empty strings will clear the key for that provider.
     """
-    stored_keys = get_api_keys_from_config()
+    stored_keys = get_api_keys_from_config(user_id)
     updated = []
 
     # Update each provider if provided in request
@@ -588,7 +614,7 @@ async def update_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateRespons
             del stored_keys["ollama"]
         updated.append("ollama")
 
-    save_api_keys_to_config(stored_keys)
+    save_api_keys_to_config(user_id, stored_keys)
     invalidate_config_cache()
 
     return ApiKeysUpdateResponse(
@@ -598,8 +624,11 @@ async def update_api_keys(request: ApiKeysUpdateRequest) -> ApiKeysUpdateRespons
 
 
 @router.delete("/api-keys")
-async def delete_all_api_keys(confirm: str | None = None) -> dict:
-    """Clear all configured API keys.
+async def delete_all_api_keys(
+    confirm: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
+    """Clear all of the caller's configured API keys.
 
     This is a destructive operation. Requires confirmation token.
 
@@ -618,14 +647,17 @@ async def delete_all_api_keys(confirm: str | None = None) -> dict:
             status_code=400,
             detail="Confirmation required. Pass confirm=CLEAR_ALL_KEYS query parameter.",
         )
-    clear_all_api_keys()
+    clear_all_api_keys(user_id)
     invalidate_config_cache()
     return {"message": "All API keys have been cleared"}
 
 
 @router.delete("/api-keys/{provider}")
-async def delete_api_key(provider: str) -> dict:
-    """Delete API key for a specific provider.
+async def delete_api_key(
+    provider: str,
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
+    """Delete the caller's API key for a specific provider.
 
     Args:
         provider: The provider name (openai, anthropic, google, openrouter, deepseek)
@@ -639,36 +671,35 @@ async def delete_api_key(provider: str) -> dict:
             detail=f"Unsupported provider: {provider}. Supported: {SUPPORTED_PROVIDERS}",
         )
 
-    delete_api_key_from_config(provider)
+    delete_api_key_from_config(user_id, provider)
     invalidate_config_cache()
 
     return {"message": f"API key for {provider} has been removed"}
 
 
 @router.post("/reset")
-async def reset_database_endpoint(request: ResetDatabaseRequest) -> dict:
-    """Reset the database and clear all data.
+async def reset_database_endpoint(
+    request: ResetDatabaseRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> dict:
+    """Reset the caller's data.
 
     WARNING: This action is irreversible. It will:
-    1. Truncate all database tables (resumes, jobs, improvements)
-    2. Delete all uploaded files
+    1. Truncate the caller's rows (resumes, jobs, improvements, applications)
+    2. Delete the caller's uploaded files
 
-    Requires confirmation token for safety.
+    Requires confirmation token for safety. Never touches another account's data.
 
     Args:
         request: Request body containing confirmation token
 
     Returns:
         Success message
-
-    Note:
-        This is a local-only endpoint for single-user deployments.
-        In production/multi-user scenarios, add proper authentication.
     """
     if request.confirm != "RESET_ALL_DATA":
         raise HTTPException(
             status_code=400,
             detail="Confirmation required. Pass confirm=RESET_ALL_DATA in request body.",
         )
-    await db.reset_database()
-    return {"message": "Database and all data have been reset successfully"}
+    await db.reset_database(user_id)
+    return {"message": "Your data has been reset successfully"}

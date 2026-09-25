@@ -4,6 +4,8 @@
  * Single source of truth for API configuration and base fetch utilities.
  */
 
+import { getAccessToken } from '@/lib/context/auth-context';
+
 const DEFAULT_PUBLIC_API_URL = '/';
 const INTERNAL_API_ORIGIN = 'http://127.0.0.1:8000';
 
@@ -73,8 +75,24 @@ export async function apiFetch(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
 
+  // Every backend data endpoint requires a Supabase session (app/auth.py
+  // verifies it and scopes the request to that account). Attach it here so
+  // no call site has to remember to — an explicit `Authorization` header the
+  // caller already set (rare) is left alone. Merged as a plain object (not a
+  // `Headers` instance) so callers building `options.headers` as a plain
+  // object — the convention everywhere else in this file — keep working.
+  const accessToken = await getAccessToken();
+  const existingHeaders = (options?.headers ?? {}) as Record<string, string>;
+  const hasAuthHeader = Object.keys(existingHeaders).some(
+    (key) => key.toLowerCase() === 'authorization'
+  );
+  const headers =
+    accessToken && !hasAuthHeader
+      ? { ...existingHeaders, Authorization: `Bearer ${accessToken}` }
+      : existingHeaders;
+
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, { ...options, headers, signal: controller.signal });
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
       throw new Error(

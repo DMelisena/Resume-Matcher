@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from app.config import load_config_file
-from app.llm import complete
+from app.llm import LLMConfig, complete
 from app.prompts.templates import (
     COVER_LETTER_PROMPT,
     GENERATE_TITLE_PROMPT,
@@ -15,6 +15,7 @@ from app.prompts import get_language_name
 
 
 def _resolve_feature_prompt(
+    user_id: str,
     custom_key: str,
     default_template: str,
 ) -> tuple[str, bool]:
@@ -26,7 +27,7 @@ def _resolve_feature_prompt(
     failure (defensive — save-time validation should have caught a
     malformed custom prompt).
     """
-    stored = load_config_file()
+    stored = load_config_file(user_id)
     custom = (stored.get(custom_key) or "").strip()
     if not custom:
         return default_template, False
@@ -34,6 +35,8 @@ def _resolve_feature_prompt(
 
 
 async def generate_cover_letter(
+    config: LLMConfig,
+    user_id: str,
     resume_data: dict[str, Any],
     job_description: str,
     language: str = "en",
@@ -41,6 +44,8 @@ async def generate_cover_letter(
     """Generate a cover letter based on resume and job description.
 
     Args:
+        config: Caller's resolved LLM config (provider/model/API key).
+        user_id: Owning account, used to resolve custom feature prompts.
         resume_data: Structured resume data (ResumeData format)
         job_description: Target job description text
         language: Output language code (en, es, zh, ja)
@@ -51,7 +56,7 @@ async def generate_cover_letter(
     output_language = get_language_name(language)
 
     template, is_custom = _resolve_feature_prompt(
-        "cover_letter_prompt", COVER_LETTER_PROMPT
+        user_id, "cover_letter_prompt", COVER_LETTER_PROMPT
     )
     try:
         prompt = template.format(
@@ -80,6 +85,7 @@ async def generate_cover_letter(
 
     result = await complete(
         prompt=prompt,
+        config=config,
         system_prompt="You are a professional career coach and resume writer. Write compelling, personalized cover letters.",
         max_tokens=2048,
     )
@@ -88,6 +94,8 @@ async def generate_cover_letter(
 
 
 async def generate_outreach_message(
+    config: LLMConfig,
+    user_id: str,
     resume_data: dict[str, Any],
     job_description: str,
     language: str = "en",
@@ -95,6 +103,8 @@ async def generate_outreach_message(
     """Generate a cold outreach message for networking.
 
     Args:
+        config: Caller's resolved LLM config (provider/model/API key).
+        user_id: Owning account, used to resolve custom feature prompts.
         resume_data: Structured resume data (ResumeData format)
         job_description: Target job description text
         language: Output language code (en, es, zh, ja)
@@ -105,7 +115,7 @@ async def generate_outreach_message(
     output_language = get_language_name(language)
 
     template, is_custom = _resolve_feature_prompt(
-        "outreach_message_prompt", OUTREACH_MESSAGE_PROMPT
+        user_id, "outreach_message_prompt", OUTREACH_MESSAGE_PROMPT
     )
     try:
         prompt = template.format(
@@ -129,6 +139,7 @@ async def generate_outreach_message(
 
     result = await complete(
         prompt=prompt,
+        config=config,
         system_prompt="You are a professional networking coach. Write genuine, engaging cold outreach messages.",
         max_tokens=1024,
     )
@@ -137,6 +148,7 @@ async def generate_outreach_message(
 
 
 async def generate_resume_title(
+    config: LLMConfig,
     job_description: str,
     language: str = "en",
 ) -> str:
@@ -158,6 +170,7 @@ async def generate_resume_title(
 
     result = await complete(
         prompt=prompt,
+        config=config,
         system_prompt="You extract job titles and company names from job descriptions.",
         max_tokens=60,
         temperature=0.3,

@@ -169,8 +169,9 @@ async def _render_with_browser(
     selector: str,
     pdf_format: str,
     pdf_margins: dict,
+    extra_headers: Optional[dict] = None,
 ) -> bytes:
-    page: Page = await browser.new_page()
+    page: Page = await browser.new_page(extra_http_headers=extra_headers or {})
     try:
         return await _render_page_to_pdf(page, url, selector, pdf_format, pdf_margins)
     finally:
@@ -201,13 +202,14 @@ def _render_resume_pdf_sync(
     selector: str,
     pdf_format: str,
     pdf_margins: dict,
+    extra_headers: Optional[dict],
 ) -> bytes:
     async def _run() -> bytes:
         async with async_playwright() as playwright:
             browser = await _launch_browser(playwright)
             try:
                 return await _render_with_browser(
-                    browser, url, selector, pdf_format, pdf_margins
+                    browser, url, selector, pdf_format, pdf_margins, extra_headers
                 )
             finally:
                 await browser.close()
@@ -220,9 +222,10 @@ async def _render_resume_pdf_in_thread(
     selector: str,
     pdf_format: str,
     pdf_margins: dict,
+    extra_headers: Optional[dict],
 ) -> bytes:
     return await asyncio.to_thread(
-        _render_resume_pdf_sync, url, selector, pdf_format, pdf_margins
+        _render_resume_pdf_sync, url, selector, pdf_format, pdf_margins, extra_headers
     )
 
 
@@ -281,6 +284,7 @@ async def render_resume_pdf(
     page_size: str = "A4",
     selector: str = ".resume-print",
     margins: Optional[dict] = None,
+    auth_token: Optional[str] = None,
 ) -> bytes:
     """Render a URL to PDF bytes.
 
@@ -289,6 +293,13 @@ async def render_resume_pdf(
         page_size: Page size format - "A4" or "LETTER"
         selector: CSS selector to wait for before rendering (default: ".resume-print")
         margins: Page margins dict with top/right/bottom/left in mm (applied to every page)
+        auth_token: The caller's verified Supabase access token, forwarded as an
+            ``Authorization: Bearer`` header on Chromium's navigation. The
+            print route is a Next.js Server Component with no browser
+            session of its own — it forwards this same header on its own
+            fetch back to the backend (see ``app/print/*/page.tsx``), so the
+            resulting PDF only ever contains data the *original* caller was
+            authorized to see. Never omit this for user-owned data.
 
     Note:
         Margins are applied via Playwright's PDF margins, ensuring they appear
@@ -298,10 +309,13 @@ async def render_resume_pdf(
 
     pdf_format = _resolve_pdf_format(page_size)
     pdf_margins = _resolve_pdf_margins(margins)
+    extra_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else None
 
     if _browser is not None:
         try:
-            return await _render_with_browser(_browser, url, selector, pdf_format, pdf_margins)
+            return await _render_with_browser(
+                _browser, url, selector, pdf_format, pdf_margins, extra_headers
+            )
         except PlaywrightError as e:
             _raise_playwright_error(e, url)
 
@@ -324,7 +338,7 @@ async def render_resume_pdf(
     if not subprocess_supported:
         try:
             return await _render_resume_pdf_in_thread(
-                url, selector, pdf_format, pdf_margins
+                url, selector, pdf_format, pdf_margins, extra_headers
             )
         except PlaywrightError as e:
             _raise_playwright_error(e, url)
@@ -333,6 +347,8 @@ async def render_resume_pdf(
         raise PDFRenderError("PDF renderer failed to initialize.")
 
     try:
-        return await _render_with_browser(_browser, url, selector, pdf_format, pdf_margins)
+        return await _render_with_browser(
+            _browser, url, selector, pdf_format, pdf_margins, extra_headers
+        )
     except PlaywrightError as e:
         _raise_playwright_error(e, url)

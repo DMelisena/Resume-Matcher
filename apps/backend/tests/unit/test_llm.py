@@ -398,6 +398,7 @@ class TestCompleteJsonFallback:
 
         result = await complete_json(
             prompt="Test prompt",
+            config=config,
             schema_type="enrichment",
             retries=2,
         )
@@ -446,7 +447,8 @@ class TestCompleteJsonFallback:
 
         from app.llm import complete_json
 
-        result = await complete_json(prompt="Extract keywords", schema_type="keywords", retries=2)
+        result = await complete_json(prompt="Extract keywords",
+            config=config, schema_type="keywords", retries=2)
 
         assert result == {"required_skills": [], "preferred_skills": [], "keywords": []}
         calls = router.acompletion.call_args_list
@@ -491,7 +493,8 @@ class TestCompleteJsonFallback:
         from app.llm import complete_json
 
         result = await complete_json(
-            prompt="Extract keywords", schema_type="keywords", retries=2
+            prompt="Extract keywords",
+            config=config, schema_type="keywords", retries=2
         )
 
         assert result == {"required_skills": [], "preferred_skills": [], "keywords": []}
@@ -546,6 +549,7 @@ class TestCompleteJsonFallback:
 
         result = await complete_json(
             prompt="Test prompt",
+            config=config,
             schema_type="resume",
             retries=2,
         )
@@ -596,7 +600,8 @@ class TestCompleteJsonFallback:
         from app.llm import complete_json
 
         result = await complete_json(
-            prompt="Test prompt", schema_type="resume", retries=2
+            prompt="Test prompt",
+            config=config, schema_type="resume", retries=2
         )
 
         assert result == {"answer": "ok"}
@@ -637,7 +642,8 @@ class TestCompleteJsonFallback:
         from app.llm import complete_json
 
         with pytest.raises(litellm.BadRequestError):
-            await complete_json(prompt="Test prompt", schema_type="resume", retries=2)
+            await complete_json(prompt="Test prompt",
+            config=config, schema_type="resume", retries=2)
 
         # No retry: an unrelated 400 fails fast (Router already handles retries).
         assert router.acompletion.await_count == 1
@@ -677,7 +683,7 @@ class TestCompleteDynamicTimeout:
 
         from app.llm import complete
 
-        await complete(prompt="Hi", max_tokens=8192)
+        await complete(prompt="Hi", config=config, max_tokens=8192)
 
         mock_calc_timeout.assert_called_once_with("completion", 8192, "deepseek")
         router.acompletion.assert_awaited_once()

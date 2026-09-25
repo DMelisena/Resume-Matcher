@@ -1,24 +1,34 @@
-"""SQLAlchemy (SQLite) data layer for Resume Matcher.
+"""SQLAlchemy (Postgres/Supabase) data layer for Resume Matcher.
 
-This is a behavior-preserving replacement for the original TinyDB wrapper. The
-``Database`` facade keeps the same method names/signatures and returns **plain
-dicts** (never ORM rows), so the ~50 call sites only needed ``await`` added.
+The ``Database`` facade keeps stable method names/signatures and returns
+**plain dicts** (never ORM rows). Every method that touches a user-owned
+table now takes ``user_id`` (the Supabase ``auth.users.id`` of the caller,
+verified upstream by ``app/auth.py``) and:
 
-Two engines back one SQLite file:
-- an **async** engine (``aiosqlite``) for the document tables and applications;
+1. Sets the Postgres ``request.jwt.claims`` GUC for the transaction, so the
+   RLS policies' ``auth.uid()`` calls resolve to this user — the
+   **authoritative** isolation boundary (see ``supabase/migrations/``).
+2. Also filters/sets ``user_id`` directly in the query — defense-in-depth, so
+   a missing or misconfigured policy can never silently leak another
+   account's rows.
+
+Two engines back one Postgres database:
+- an **async** engine (``asyncpg``) for the document tables and applications;
 - a **sync** engine for the encrypted ``api_keys`` table, which is read on the
   synchronous LLM hot path (``get_llm_config`` → ``resolve_api_key``).
 """
 
 import asyncio
+import json
 import logging
 import shutil
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session, sessionmaker
@@ -30,7 +40,7 @@ from app.models import ApiKey, Application, Improvement, Job, Resume
 logger = logging.getLogger(__name__)
 
 # Columns that are first-class on the jobs table; everything else the pipeline
-# attaches dynamically is stored in ``metadata_json`` (see Job model).
+# attaches dynamically is stored in ``metadata_json``.
 _JOB_CORE_FIELDS = frozenset({"job_id", "content", "resume_id", "created_at"})
 
 # Application status columns (stable keys, decoupled from i18n labels).
@@ -50,17 +60,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class Database:
-    """Async SQLAlchemy facade for resume matcher data."""
+def _jwt_claims_for(user_id: str) -> str:
+    """Build the ``request.jwt.claims`` payload RLS policies' ``auth.uid()`` read."""
+    return json.dumps({"sub": str(user_id), "role": "authenticated"})
 
-    # Serializes concurrent master-resume promotion. Stays the *primary*
-    # mechanism for the single-master invariant (the partial unique index is a
-    # storage-level backstop).
+
+class Database:
+    """Async SQLAlchemy facade for resume matcher data, scoped per account."""
+
+    # Serializes concurrent master-resume promotion *within this process*.
+    # Stays the primary mechanism for the single-master-per-user invariant;
+    # the partial unique index is a storage-level backstop.
     _master_resume_lock = asyncio.Lock()
 
-    def __init__(self, db_path: Path | None = None):
-        self.db_path = db_path or settings.sqlite_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, database_url: str | None = None):
+        self.async_database_url = database_url or settings.async_database_url
+        self.sync_database_url = (
+            settings.sync_database_url if database_url is None else database_url
+        )
         self._async_engine = None
         self._async_session_factory: async_sessionmaker[AsyncSession] | None = None
         self._sync_engine = None
@@ -70,18 +87,13 @@ class Database:
     # -- engine / session plumbing ------------------------------------------
 
     def _ensure_initialized(self) -> None:
-        """Create engines and tables once (idempotent).
-
-        Tables are created via the **sync** engine so both the sync (api_keys)
-        and async (docs) paths see them immediately, without needing an event
-        loop. Both engines point at the same file.
-        """
+        """Create engines and tables once (idempotent)."""
         if self._initialized:
             return
-        self._sync_engine = make_sync_engine(self.db_path)
+        self._sync_engine = make_sync_engine(self.sync_database_url)
         self._sync_session_factory = sessionmaker(self._sync_engine, expire_on_commit=False)
         init_models_sync(self._sync_engine)
-        self._async_engine = make_async_engine(self.db_path)
+        self._async_engine = make_async_engine(self.async_database_url)
         self._async_session_factory = async_sessionmaker(
             self._async_engine, expire_on_commit=False
         )
@@ -99,8 +111,37 @@ class Database:
         assert self._sync_session_factory is not None
         return self._sync_session_factory
 
+    @asynccontextmanager
+    async def _user_session(self, user_id: str) -> AsyncIterator[AsyncSession]:
+        """Open an async session scoped (for this transaction only) to ``user_id``.
+
+        The connection logs in as ``resume_matcher_app`` (see the migration),
+        which has no privileges of its own; ``SET LOCAL ROLE authenticated``
+        adopts the RLS-subject role only for this transaction, and setting
+        ``request.jwt.claims`` is what makes the policies' ``auth.uid()``
+        resolve to ``user_id``. Both reset automatically at commit/rollback.
+        """
+        async with self._session() as session:
+            await session.execute(text("SET LOCAL ROLE authenticated"))
+            await session.execute(
+                text("SELECT set_config('request.jwt.claims', :claims, true)"),
+                {"claims": _jwt_claims_for(user_id)},
+            )
+            yield session
+
+    @contextmanager
+    def _user_sync_session(self, user_id: str) -> Iterator[Session]:
+        """Open a sync session scoped (for this transaction only) to ``user_id``. See `_user_session`."""
+        with self._sync() as session:
+            session.execute(text("SET LOCAL ROLE authenticated"))
+            session.execute(
+                text("SELECT set_config('request.jwt.claims', :claims, true)"),
+                {"claims": _jwt_claims_for(user_id)},
+            )
+            yield session
+
     async def close(self) -> None:
-        """Dispose engines and release file handles."""
+        """Dispose engines and release connections."""
         if self._async_engine is not None:
             await self._async_engine.dispose()
             self._async_engine = None
@@ -181,6 +222,7 @@ class Database:
 
     async def create_resume(
         self,
+        user_id: str,
         content: str,
         content_type: str = "md",
         filename: str | None = None,
@@ -194,16 +236,17 @@ class Database:
         original_markdown: str | None = None,
         interview_prep: str | None = None,
     ) -> dict[str, Any]:
-        """Create a new resume entry.
+        """Create a new resume entry owned by ``user_id``.
 
         processing_status: "pending", "processing", "ready", "failed"
         """
         resume_id = str(uuid4())
         now = _now()
-        async with self._session() as session:
+        async with self._user_session(user_id) as session:
             session.add(
                 Resume(
                     resume_id=resume_id,
+                    user_id=user_id,
                     content=content,
                     content_type=content_type,
                     filename=filename,
@@ -244,6 +287,7 @@ class Database:
 
     async def create_resume_atomic_master(
         self,
+        user_id: str,
         content: str,
         content_type: str = "md",
         filename: str | None = None,
@@ -255,13 +299,16 @@ class Database:
         title: str | None = None,
         interview_prep: str | None = None,
     ) -> dict[str, Any]:
-        """Create a new resume with atomic master assignment.
+        """Create a new resume with atomic master assignment, scoped to ``user_id``.
 
         Uses an asyncio.Lock to prevent race conditions when multiple uploads
-        happen concurrently and both try to become master.
+        happen concurrently and both try to become master. The lock is process
+        -wide (not per-user) — cheap and correct, since master promotion is
+        infrequent and the actual invariant is enforced per-user by the
+        partial unique index.
         """
         async with self._master_resume_lock:
-            current_master = await self.get_master_resume()
+            current_master = await self.get_master_resume(user_id)
             is_master = current_master is None
 
             # Recovery: if the current master is stuck failed/processing, demote
@@ -270,14 +317,15 @@ class Database:
                 "failed",
                 "processing",
             ):
-                async with self._session() as session:
-                    row = await session.get(Resume, current_master["resume_id"])
+                async with self._user_session(user_id) as session:
+                    row = await self._get_owned(session, Resume, "resume_id", current_master["resume_id"], user_id)
                     if row is not None:
                         row.is_master = False
                         await session.commit()
                 is_master = True
 
             return await self.create_resume(
+                user_id=user_id,
                 content=content,
                 content_type=content_type,
                 filename=filename,
@@ -291,32 +339,48 @@ class Database:
                 title=title,
             )
 
-    async def get_resume(self, resume_id: str) -> dict[str, Any] | None:
-        """Get resume by ID."""
-        async with self._session() as session:
-            row = await session.get(Resume, resume_id)
+    @staticmethod
+    async def _get_owned(
+        session: AsyncSession, model: type, pk_name: str, pk_value: str, user_id: str
+    ) -> Any:
+        """Fetch a row by primary key, scoped to ``user_id`` (defense-in-depth over RLS)."""
+        result = await session.execute(
+            select(model).where(
+                getattr(model, pk_name) == pk_value, model.user_id == user_id
+            )
+        )
+        return result.scalars().first()
+
+    async def get_resume(self, user_id: str, resume_id: str) -> dict[str, Any] | None:
+        """Get resume by ID, scoped to ``user_id``."""
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(session, Resume, "resume_id", resume_id, user_id)
             return self._resume_to_dict(row) if row else None
 
-    async def get_master_resume(self) -> dict[str, Any] | None:
-        """Get the master resume if exists."""
-        async with self._session() as session:
+    async def get_master_resume(self, user_id: str) -> dict[str, Any] | None:
+        """Get the caller's master resume if one exists."""
+        async with self._user_session(user_id) as session:
             result = await session.execute(
-                select(Resume).where(Resume.is_master.is_(True))
+                select(Resume).where(Resume.is_master.is_(True), Resume.user_id == user_id)
             )
             row = result.scalars().first()
             return self._resume_to_dict(row) if row else None
 
-    async def update_resume(self, resume_id: str, updates: dict[str, Any]) -> dict[str, Any]:
-        """Update resume by ID.
+    async def update_resume(
+        self, user_id: str, resume_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Update resume by ID, scoped to ``user_id``.
 
         Raises:
-            ValueError: If resume not found.
+            ValueError: If resume not found (or not owned by ``user_id``).
         """
-        async with self._session() as session:
-            row = await session.get(Resume, resume_id)
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(session, Resume, "resume_id", resume_id, user_id)
             if row is None:
                 raise ValueError(f"Resume not found: {resume_id}")
             for key, value in updates.items():
+                if key in ("resume_id", "user_id"):
+                    continue
                 if hasattr(row, key):
                     setattr(row, key, value)
                 else:
@@ -325,36 +389,39 @@ class Database:
             await session.commit()
             return self._resume_to_dict(row)
 
-    async def delete_resume(self, resume_id: str) -> bool:
-        """Delete resume by ID."""
-        async with self._session() as session:
-            row = await session.get(Resume, resume_id)
+    async def delete_resume(self, user_id: str, resume_id: str) -> bool:
+        """Delete resume by ID, scoped to ``user_id``."""
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(session, Resume, "resume_id", resume_id, user_id)
             if row is None:
                 return False
             await session.delete(row)
             await session.commit()
             return True
 
-    async def list_resumes(self) -> list[dict[str, Any]]:
-        """List all resumes."""
-        async with self._session() as session:
-            result = await session.execute(select(Resume).order_by(Resume.created_at))
+    async def list_resumes(self, user_id: str) -> list[dict[str, Any]]:
+        """List all resumes owned by ``user_id``."""
+        async with self._user_session(user_id) as session:
+            result = await session.execute(
+                select(Resume).where(Resume.user_id == user_id).order_by(Resume.created_at)
+            )
             return [self._resume_to_dict(row) for row in result.scalars().all()]
 
-    async def set_master_resume(self, resume_id: str) -> bool:
-        """Set a resume as the master, unsetting any existing master.
+    async def set_master_resume(self, user_id: str, resume_id: str) -> bool:
+        """Set a resume as the caller's master, unsetting any existing master.
 
-        Returns False if the resume doesn't exist. Demote-then-promote happens
-        in a single transaction so the partial unique index is never violated.
+        Returns False if the resume doesn't exist (or isn't owned by
+        ``user_id``). Demote-then-promote happens in a single transaction so
+        the partial unique index is never violated.
         """
-        async with self._session() as session:
-            target = await session.get(Resume, resume_id)
+        async with self._user_session(user_id) as session:
+            target = await self._get_owned(session, Resume, "resume_id", resume_id, user_id)
             if target is None:
-                logger.warning("Cannot set master: resume %s not found", resume_id)
+                logger.warning("Cannot set master: resume %s not found for user", resume_id)
                 return False
 
             current = await session.execute(
-                select(Resume).where(Resume.is_master.is_(True))
+                select(Resume).where(Resume.is_master.is_(True), Resume.user_id == user_id)
             )
             for row in current.scalars().all():
                 if row.resume_id != resume_id:
@@ -367,13 +434,22 @@ class Database:
 
     # -- Job operations -----------------------------------------------------
 
-    async def create_job(self, content: str, resume_id: str | None = None) -> dict[str, Any]:
-        """Create a new job description entry."""
+    async def create_job(
+        self, user_id: str, content: str, resume_id: str | None = None
+    ) -> dict[str, Any]:
+        """Create a new job description entry owned by ``user_id``."""
         job_id = str(uuid4())
         now = _now()
-        async with self._session() as session:
+        async with self._user_session(user_id) as session:
             session.add(
-                Job(job_id=job_id, content=content, resume_id=resume_id, created_at=now, metadata_json={})
+                Job(
+                    job_id=job_id,
+                    user_id=user_id,
+                    content=content,
+                    resume_id=resume_id,
+                    created_at=now,
+                    metadata_json={},
+                )
             )
             await session.commit()
         return {
@@ -383,28 +459,30 @@ class Database:
             "created_at": now,
         }
 
-    async def get_job(self, job_id: str) -> dict[str, Any] | None:
-        """Get job by ID (dynamic fields flattened to top level)."""
-        async with self._session() as session:
-            row = await session.get(Job, job_id)
+    async def get_job(self, user_id: str, job_id: str) -> dict[str, Any] | None:
+        """Get job by ID, scoped to ``user_id`` (dynamic fields flattened)."""
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(session, Job, "job_id", job_id, user_id)
             return self._job_to_dict(row) if row else None
 
     async def update_job(
-        self, job_id: str, updates: dict[str, Any]
+        self, user_id: str, job_id: str, updates: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Update a job by ID.
+        """Update a job by ID, scoped to ``user_id``.
 
         Core columns are set directly; every other key is merged into
         ``metadata_json`` so dynamic pipeline fields (``preview_hash``,
         ``job_keywords``, ``company``/``role``, …) round-trip through
         ``get_job`` as top-level keys.
         """
-        async with self._session() as session:
-            row = await session.get(Job, job_id)
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(session, Job, "job_id", job_id, user_id)
             if row is None:
                 return None
             meta = dict(row.metadata_json or {})
             for key, value in updates.items():
+                if key in ("user_id",):
+                    continue
                 if key in _JOB_CORE_FIELDS:
                     setattr(row, key, value)
                 else:
@@ -414,10 +492,10 @@ class Database:
             await session.commit()
             return self._job_to_dict(row)
 
-    async def delete_job(self, job_id: str) -> bool:
-        """Delete a job by ID (used to clean up an orphaned manual-add job)."""
-        async with self._session() as session:
-            row = await session.get(Job, job_id)
+    async def delete_job(self, user_id: str, job_id: str) -> bool:
+        """Delete a job by ID, scoped to ``user_id`` (used to clean up an orphaned manual-add job)."""
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(session, Job, "job_id", job_id, user_id)
             if row is None:
                 return False
             await session.delete(row)
@@ -428,18 +506,20 @@ class Database:
 
     async def create_improvement(
         self,
+        user_id: str,
         original_resume_id: str,
         tailored_resume_id: str,
         job_id: str,
         improvements: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Create an improvement result entry."""
+        """Create an improvement result entry owned by ``user_id``."""
         request_id = str(uuid4())
         now = _now()
-        async with self._session() as session:
+        async with self._user_session(user_id) as session:
             session.add(
                 Improvement(
                     request_id=request_id,
+                    user_id=user_id,
                     original_resume_id=original_resume_id,
                     tailored_resume_id=tailored_resume_id,
                     job_id=job_id,
@@ -458,13 +538,14 @@ class Database:
         }
 
     async def get_improvement_by_tailored_resume(
-        self, tailored_resume_id: str
+        self, user_id: str, tailored_resume_id: str
     ) -> dict[str, Any] | None:
-        """Get improvement record by tailored resume ID."""
-        async with self._session() as session:
+        """Get improvement record by tailored resume ID, scoped to ``user_id``."""
+        async with self._user_session(user_id) as session:
             result = await session.execute(
                 select(Improvement).where(
-                    Improvement.tailored_resume_id == tailored_resume_id
+                    Improvement.tailored_resume_id == tailored_resume_id,
+                    Improvement.user_id == user_id,
                 )
             )
             row = result.scalars().first()
@@ -472,19 +553,19 @@ class Database:
 
     # -- Application (tracker) operations -----------------------------------
 
-    async def _next_position(self, session: AsyncSession, status: str) -> int:
+    async def _next_position(self, session: AsyncSession, user_id: str, status: str) -> int:
         result = await session.execute(
             select(func.count())
             .select_from(Application)
-            .where(Application.status == status)
+            .where(Application.status == status, Application.user_id == user_id)
         )
         return int(result.scalar() or 0)
 
-    async def _renumber(self, session: AsyncSession, status: str) -> None:
+    async def _renumber(self, session: AsyncSession, user_id: str, status: str) -> None:
         """Renumber a column's positions to a contiguous 0..n-1 sequence."""
         result = await session.execute(
             select(Application)
-            .where(Application.status == status)
+            .where(Application.status == status, Application.user_id == user_id)
             .order_by(Application.position, Application.created_at)
         )
         for index, row in enumerate(result.scalars().all()):
@@ -493,6 +574,7 @@ class Database:
 
     async def create_application(
         self,
+        user_id: str,
         job_id: str,
         resume_id: str,
         master_resume_id: str | None = None,
@@ -502,15 +584,17 @@ class Database:
         applied_at: str | None = None,
         notes: str | None = None,
     ) -> dict[str, Any]:
-        """Create a tracker card, deduped on (job_id, resume_id).
+        """Create a tracker card owned by ``user_id``, deduped on (owner, job_id, resume_id).
 
-        If a card for the same job+resume already exists it is returned as-is
-        (survives double-submit / retried confirms).
+        If a card for the same job+resume already exists for this user it is
+        returned as-is (survives double-submit / retried confirms).
         """
-        async with self._session() as session:
+        async with self._user_session(user_id) as session:
             existing = await session.execute(
                 select(Application).where(
-                    Application.job_id == job_id, Application.resume_id == resume_id
+                    Application.user_id == user_id,
+                    Application.job_id == job_id,
+                    Application.resume_id == resume_id,
                 )
             )
             found = existing.scalars().first()
@@ -520,9 +604,10 @@ class Database:
             now = _now()
             if applied_at is None and status != "saved":
                 applied_at = now
-            position = await self._next_position(session, status)
+            position = await self._next_position(session, user_id, status)
             row = Application(
                 application_id=str(uuid4()),
+                user_id=user_id,
                 job_id=job_id,
                 resume_id=resume_id,
                 master_resume_id=master_resume_id,
@@ -539,11 +624,12 @@ class Database:
             try:
                 await session.commit()
             except IntegrityError:
-                # A concurrent create won the (job_id, resume_id) unique
+                # A concurrent create won the (user_id, job_id, resume_id) unique
                 # constraint — return the existing card instead of duplicating.
                 await session.rollback()
                 dup = await session.execute(
                     select(Application).where(
+                        Application.user_id == user_id,
                         Application.job_id == job_id,
                         Application.resume_id == resume_id,
                     )
@@ -559,33 +645,41 @@ class Database:
                 raise
             return self._application_to_dict(row)
 
-    async def list_applications(self, status: str | None = None) -> list[dict[str, Any]]:
-        """List applications ordered by (status, position)."""
-        async with self._session() as session:
-            stmt = select(Application)
+    async def list_applications(
+        self, user_id: str, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List applications owned by ``user_id``, ordered by (status, position)."""
+        async with self._user_session(user_id) as session:
+            stmt = select(Application).where(Application.user_id == user_id)
             if status is not None:
                 stmt = stmt.where(Application.status == status)
             stmt = stmt.order_by(Application.status, Application.position)
             result = await session.execute(stmt)
             return [self._application_to_dict(row) for row in result.scalars().all()]
 
-    async def get_application(self, application_id: str) -> dict[str, Any] | None:
-        """Get an application by ID."""
-        async with self._session() as session:
-            row = await session.get(Application, application_id)
+    async def get_application(
+        self, user_id: str, application_id: str
+    ) -> dict[str, Any] | None:
+        """Get an application by ID, scoped to ``user_id``."""
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(
+                session, Application, "application_id", application_id, user_id
+            )
             return self._application_to_dict(row) if row else None
 
     async def update_application(
-        self, application_id: str, updates: dict[str, Any]
+        self, user_id: str, application_id: str, updates: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Update an application; renumber columns when status/position change.
+        """Update an application owned by ``user_id``; renumber columns when status/position change.
 
         ``position`` is interpreted as the desired index within the (possibly
         new) ``status`` column; siblings are renumbered server-side so the
         column stays a contiguous 0..n-1 sequence.
         """
-        async with self._session() as session:
-            row = await session.get(Application, application_id)
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(
+                session, Application, "application_id", application_id, user_id
+            )
             if row is None:
                 return None
 
@@ -604,11 +698,12 @@ class Database:
                 row.position = 10_000_000
                 await session.flush()
                 if old_status != new_status:
-                    await self._renumber(session, old_status)
+                    await self._renumber(session, user_id, old_status)
                 # Renumber the target column excluding this row, then splice in.
                 siblings = await session.execute(
                     select(Application)
                     .where(
+                        Application.user_id == user_id,
                         Application.status == new_status,
                         Application.application_id != application_id,
                     )
@@ -628,14 +723,16 @@ class Database:
             return self._application_to_dict(row)
 
     async def bulk_update_applications(
-        self, application_ids: list[str], status: str
+        self, user_id: str, application_ids: list[str], status: str
     ) -> int:
-        """Move many applications to the end of ``status``. Returns count moved."""
+        """Move many of the caller's applications to the end of ``status``. Returns count moved."""
         moved = 0
-        async with self._session() as session:
+        async with self._user_session(user_id) as session:
             affected_old: set[str] = set()
             for application_id in application_ids:
-                row = await session.get(Application, application_id)
+                row = await self._get_owned(
+                    session, Application, "application_id", application_id, user_id
+                )
                 if row is None:
                     continue
                 affected_old.add(row.status)
@@ -645,31 +742,35 @@ class Database:
                 moved += 1
             await session.flush()
             for old_status in affected_old - {status}:
-                await self._renumber(session, old_status)
-            await self._renumber(session, status)
+                await self._renumber(session, user_id, old_status)
+            await self._renumber(session, user_id, status)
             await session.commit()
         return moved
 
-    async def delete_application(self, application_id: str) -> bool:
-        """Delete an application; renumber its column."""
-        async with self._session() as session:
-            row = await session.get(Application, application_id)
+    async def delete_application(self, user_id: str, application_id: str) -> bool:
+        """Delete an application owned by ``user_id``; renumber its column."""
+        async with self._user_session(user_id) as session:
+            row = await self._get_owned(
+                session, Application, "application_id", application_id, user_id
+            )
             if row is None:
                 return False
             status = row.status
             await session.delete(row)
             await session.flush()
-            await self._renumber(session, status)
+            await self._renumber(session, user_id, status)
             await session.commit()
             return True
 
-    async def bulk_delete_applications(self, application_ids: list[str]) -> int:
-        """Delete many applications; renumber affected columns. Returns count."""
+    async def bulk_delete_applications(self, user_id: str, application_ids: list[str]) -> int:
+        """Delete many of the caller's applications; renumber affected columns. Returns count."""
         deleted = 0
-        async with self._session() as session:
+        async with self._user_session(user_id) as session:
             affected: set[str] = set()
             for application_id in application_ids:
-                row = await session.get(Application, application_id)
+                row = await self._get_owned(
+                    session, Application, "application_id", application_id, user_id
+                )
                 if row is None:
                     continue
                 affected.add(row.status)
@@ -677,73 +778,113 @@ class Database:
                 deleted += 1
             await session.flush()
             for status in affected:
-                await self._renumber(session, status)
+                await self._renumber(session, user_id, status)
             await session.commit()
         return deleted
 
     # -- Encrypted API key store (sync; read on the LLM hot path) -----------
 
-    def get_api_key_ciphertexts(self) -> dict[str, str]:
-        """Return ``{provider: ciphertext}`` for all stored keys (sync)."""
-        with self._sync() as session:
-            rows = session.execute(select(ApiKey)).scalars().all()
+    def get_api_key_ciphertexts(self, user_id: str) -> dict[str, str]:
+        """Return ``{provider: ciphertext}`` for keys stored by ``user_id`` (sync)."""
+        with self._user_sync_session(user_id) as session:
+            rows = (
+                session.execute(select(ApiKey).where(ApiKey.user_id == user_id))
+                .scalars()
+                .all()
+            )
             return {row.provider: row.ciphertext for row in rows}
 
-    def set_api_key_ciphertext(self, provider: str, ciphertext: str) -> None:
-        """Upsert one provider's ciphertext (sync)."""
-        with self._sync() as session:
-            row = session.get(ApiKey, provider)
+    def set_api_key_ciphertext(self, user_id: str, provider: str, ciphertext: str) -> None:
+        """Upsert one provider's ciphertext for ``user_id`` (sync)."""
+        with self._user_sync_session(user_id) as session:
+            row = (
+                session.execute(
+                    select(ApiKey).where(
+                        ApiKey.user_id == user_id, ApiKey.provider == provider
+                    )
+                )
+                .scalars()
+                .first()
+            )
             if row is None:
                 session.add(
-                    ApiKey(provider=provider, ciphertext=ciphertext, updated_at=_now())
+                    ApiKey(
+                        id=str(uuid4()),
+                        user_id=user_id,
+                        provider=provider,
+                        ciphertext=ciphertext,
+                        updated_at=_now(),
+                    )
                 )
             else:
                 row.ciphertext = ciphertext
                 row.updated_at = _now()
             session.commit()
 
-    def delete_api_key(self, provider: str) -> None:
-        """Delete one provider's key (sync)."""
-        with self._sync() as session:
-            row = session.get(ApiKey, provider)
+    def delete_api_key(self, user_id: str, provider: str) -> None:
+        """Delete one provider's key for ``user_id`` (sync)."""
+        with self._user_sync_session(user_id) as session:
+            row = (
+                session.execute(
+                    select(ApiKey).where(
+                        ApiKey.user_id == user_id, ApiKey.provider == provider
+                    )
+                )
+                .scalars()
+                .first()
+            )
             if row is not None:
                 session.delete(row)
                 session.commit()
 
-    def clear_api_keys(self) -> None:
-        """Delete all stored keys (sync)."""
-        with self._sync() as session:
-            session.execute(delete(ApiKey))
+    def clear_api_keys(self, user_id: str) -> None:
+        """Delete all keys stored by ``user_id`` (sync)."""
+        with self._user_sync_session(user_id) as session:
+            session.execute(delete(ApiKey).where(ApiKey.user_id == user_id))
             session.commit()
 
-    def replace_api_keys(self, ciphertexts: dict[str, str]) -> None:
-        """Atomically replace the whole key store (clear + insert in one txn).
+    def replace_api_keys(self, user_id: str, ciphertexts: dict[str, str]) -> None:
+        """Atomically replace ``user_id``'s whole key store (clear + insert in one txn).
 
         A single transaction means a failure mid-write can't leave the store
         half-cleared and wipe a user's previously saved keys.
         """
-        with self._sync() as session:
-            session.execute(delete(ApiKey))
+        with self._user_sync_session(user_id) as session:
+            session.execute(delete(ApiKey).where(ApiKey.user_id == user_id))
             now = _now()
             for provider, ciphertext in ciphertexts.items():
                 if ciphertext:
                     session.add(
-                        ApiKey(provider=provider, ciphertext=ciphertext, updated_at=now)
+                        ApiKey(
+                            id=str(uuid4()),
+                            user_id=user_id,
+                            provider=provider,
+                            ciphertext=ciphertext,
+                            updated_at=now,
+                        )
                     )
             session.commit()
 
     # -- Stats / maintenance ------------------------------------------------
 
-    async def get_stats(self) -> dict[str, Any]:
-        """Get database statistics."""
-        async with self._session() as session:
-            resumes = await session.scalar(select(func.count()).select_from(Resume))
-            jobs = await session.scalar(select(func.count()).select_from(Job))
+    async def get_stats(self, user_id: str) -> dict[str, Any]:
+        """Get database statistics scoped to ``user_id``."""
+        async with self._user_session(user_id) as session:
+            resumes = await session.scalar(
+                select(func.count()).select_from(Resume).where(Resume.user_id == user_id)
+            )
+            jobs = await session.scalar(
+                select(func.count()).select_from(Job).where(Job.user_id == user_id)
+            )
             improvements = await session.scalar(
-                select(func.count()).select_from(Improvement)
+                select(func.count())
+                .select_from(Improvement)
+                .where(Improvement.user_id == user_id)
             )
             master = await session.execute(
-                select(Resume.resume_id).where(Resume.is_master.is_(True)).limit(1)
+                select(Resume.resume_id)
+                .where(Resume.is_master.is_(True), Resume.user_id == user_id)
+                .limit(1)
             )
             return {
                 "total_resumes": int(resumes or 0),
@@ -752,22 +893,23 @@ class Database:
                 "has_master_resume": master.first() is not None,
             }
 
-    async def reset_database(self) -> None:
-        """Reset by truncating user-document tables and clearing uploads.
+    async def reset_database(self, user_id: str) -> None:
+        """Reset ``user_id``'s data by truncating their rows and clearing their uploads.
 
-        Clears resumes/jobs/improvements **and** tracker applications (leaving
-        orphaned cards after a full data reset would be a bug). Encrypted
-        ``api_keys`` are preserved — matching the pre-existing behavior where a
-        reset never wiped the user's stored credentials.
+        Clears the caller's resumes/jobs/improvements **and** tracker
+        applications (leaving orphaned cards after a full data reset would be
+        a bug). Encrypted ``api_keys`` are preserved — matching the
+        pre-existing behavior where a reset never wiped the user's stored
+        credentials. Never touches another account's rows.
         """
-        async with self._session() as session:
-            await session.execute(delete(Application))
-            await session.execute(delete(Improvement))
-            await session.execute(delete(Job))
-            await session.execute(delete(Resume))
+        async with self._user_session(user_id) as session:
+            await session.execute(delete(Application).where(Application.user_id == user_id))
+            await session.execute(delete(Improvement).where(Improvement.user_id == user_id))
+            await session.execute(delete(Job).where(Job.user_id == user_id))
+            await session.execute(delete(Resume).where(Resume.user_id == user_id))
             await session.commit()
 
-        uploads_dir = settings.data_dir / "uploads"
+        uploads_dir = settings.data_dir / "uploads" / user_id
         if uploads_dir.exists():
             shutil.rmtree(uploads_dir)
             uploads_dir.mkdir(parents=True, exist_ok=True)

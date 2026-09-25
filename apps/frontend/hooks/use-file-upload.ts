@@ -9,6 +9,7 @@ import {
   type DragEvent,
   type InputHTMLAttributes,
 } from 'react';
+import { getAccessToken } from '@/lib/context/auth-context';
 
 export type FileMetadata = {
   name: string;
@@ -226,9 +227,14 @@ export const useFileUpload = (
       markUploadStarted();
 
       try {
+        // Uploads go through a raw fetch (multipart body), not the apiFetch
+        // wrapper — attach the Supabase bearer token here so the backend can
+        // still scope the upload to the caller's account.
+        const accessToken = await getAccessToken();
         const response = await fetch(uploadUrl, {
           method: 'POST',
           body: formData,
+          headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
         });
 
         let responseData: Record<string, unknown> = {}; // Initialize for broader scope

@@ -99,6 +99,7 @@ def _serialize_resume_data_for_prompt(resume_data: dict[str, Any]) -> str:
 
 
 async def generate_interview_prep(
+    user_id: str,
     resume_data: dict[str, Any],
     job_description: str,
     language: str = "en",
@@ -112,11 +113,12 @@ async def generate_interview_prep(
         resume_data=_serialize_resume_data_for_prompt(resume_data),
         output_language=get_language_name(language),
     )
-    config = get_llm_config()
+    config = get_llm_config(user_id)
     max_tokens = get_safe_max_tokens(get_model_name(config), requested=8192)
 
     result = await complete_json(
         prompt=prompt,
+        config=config,
         system_prompt=(
             "You are a career interview coach. Output truthful, resume-grounded "
             "interview preparation as JSON only."

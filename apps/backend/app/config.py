@@ -1,6 +1,7 @@
 """Application configuration using pydantic-settings."""
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Literal
 
@@ -29,17 +30,19 @@ def _write_config_json(config: dict[str, Any]) -> None:
     CONFIG_FILE_PATH.write_text(json.dumps(config, indent=2))
 
 
-def load_config_file() -> dict[str, Any]:
-    """Load non-secret configuration, with decrypted API keys injected.
+def load_config_file(user_id: str) -> dict[str, Any]:
+    """Load non-secret configuration, with the caller's decrypted API keys injected.
 
-    API keys live in the encrypted SQLite store, not config.json. They are
-    injected here under ``api_keys`` so ``resolve_api_key(stored, provider)``
-    keeps resolving per-provider keys everywhere ``stored`` is built from this
+    ``config.json`` holds shared, non-secret app settings (provider/model
+    choice, language, feature prompts). API keys are per-account and live in
+    the encrypted Postgres store, not config.json. They are injected here
+    under ``api_keys`` so ``resolve_api_key(stored, provider)`` keeps
+    resolving per-provider keys everywhere ``stored`` is built from this
     function. ``save_config_file`` strips them again, so they never round-trip
     back to disk.
     """
     config = _read_config_json()
-    config["api_keys"] = get_api_keys_from_config()
+    config["api_keys"] = get_api_keys_from_config(user_id)
     return config
 
 
@@ -55,8 +58,8 @@ def save_config_file(config: dict[str, Any]) -> None:
     _write_config_json(config)
 
 
-def get_api_keys_from_config() -> dict[str, str]:
-    """Get decrypted API keys from the encrypted SQLite store.
+def get_api_keys_from_config(user_id: str) -> dict[str, str]:
+    """Get ``user_id``'s decrypted API keys from the encrypted Postgres store.
 
     Returns:
         Dictionary with key-store provider names as keys and plaintext keys as
@@ -66,15 +69,15 @@ def get_api_keys_from_config() -> dict[str, str]:
     from app.database import db
 
     decrypted: dict[str, str] = {}
-    for provider, ciphertext in db.get_api_key_ciphertexts().items():
+    for provider, ciphertext in db.get_api_key_ciphertexts(user_id).items():
         plaintext = decrypt(ciphertext)
         if plaintext:
             decrypted[provider] = plaintext
     return decrypted
 
 
-def save_api_keys_to_config(api_keys: dict[str, str]) -> None:
-    """Replace the encrypted key store with ``api_keys`` (encrypting each).
+def save_api_keys_to_config(user_id: str, api_keys: dict[str, str]) -> None:
+    """Replace ``user_id``'s encrypted key store with ``api_keys`` (encrypting each).
 
     Replace-all semantics mirror the legacy ``config["api_keys"] = api_keys``;
     the config router reads-merges-saves the full map.
@@ -86,21 +89,26 @@ def save_api_keys_to_config(api_keys: dict[str, str]) -> None:
     # failure (encryption error or DB write) can never wipe previously stored
     # keys mid-replace.
     ciphertexts = {provider: encrypt(key) for provider, key in api_keys.items() if key}
-    db.replace_api_keys(ciphertexts)
+    db.replace_api_keys(user_id, ciphertexts)
 
 
-def delete_api_key_from_config(provider: str) -> None:
-    """Delete a specific API key from the encrypted store."""
+def delete_api_key_from_config(user_id: str, provider: str) -> None:
+    """Delete a specific API key from ``user_id``'s encrypted store."""
     from app.database import db
 
-    db.delete_api_key(provider)
+    db.delete_api_key(user_id, provider)
 
 
-def clear_all_api_keys() -> None:
-    """Clear all API keys from the encrypted store and any legacy config slots."""
+def clear_all_api_keys(user_id: str) -> None:
+    """Clear all of ``user_id``'s API keys and any legacy config slots.
+
+    The legacy plaintext ``config.json`` slots are shared/global leftovers
+    from the single-tenant era; clearing them here is harmless (they are
+    re-derived from the encrypted per-user store, never the other way).
+    """
     from app.database import db
 
-    db.clear_api_keys()
+    db.clear_api_keys(user_id)
     # Defensively clear any legacy plaintext remnants from config.json.
     config = _read_config_json()
     if "api_keys" in config or "api_key" in config:
@@ -110,43 +118,25 @@ def clear_all_api_keys() -> None:
 
 
 def migrate_legacy_keys() -> None:
-    """Fold legacy plaintext keys from config.json into the encrypted store.
+    """No-op since the API key store became per-account.
 
-    Idempotent and non-clobbering: an existing config.json ``api_keys`` map and
-    the legacy single ``api_key`` (mapped to its key-store provider via the
-    active provider) are written to the encrypted store **only if that provider
-    slot is empty**, then removed from config.json. This eliminates the
-    legacy-shadow bug where ``resolve_api_key`` returned one shared key for
-    every provider.
+    This used to fold legacy plaintext keys from the single-tenant
+    ``config.json`` into the (then-global) encrypted store at startup. Keys
+    are now scoped per Supabase account, and this function runs with no
+    request context — there is no user to attribute a legacy global key to,
+    so guessing an owner would silently hand one account's old key to
+    whichever account happens to trigger the next lookup. Any pre-migration
+    plaintext keys must be migrated explicitly per account (see
+    ``app/scripts/migrate_sqlite_to_supabase.py`` / the deployment runbook)
+    rather than automatically at boot.
     """
     config = _read_config_json()
-    legacy_map = config.get("api_keys")
-    legacy_single = config.get("api_key")
-    if not legacy_map and not legacy_single:
-        return
-
-    from app.crypto import encrypt
-    from app.database import db
-
-    existing = set(db.get_api_key_ciphertexts().keys())
-
-    if isinstance(legacy_map, dict):
-        for provider, key in legacy_map.items():
-            if key and provider not in existing:
-                db.set_api_key_ciphertext(provider, encrypt(key))
-                existing.add(provider)
-
-    if legacy_single:
-        # Map the active LLM provider to its key-store provider name.
-        provider = config.get("provider") or settings.llm_provider
-        key_provider = _LEGACY_PROVIDER_KEY_MAP.get(provider, provider)
-        if key_provider not in existing:
-            db.set_api_key_ciphertext(key_provider, encrypt(legacy_single))
-
-    # Strip the legacy slots from config.json now that they're in the store.
-    config.pop("api_keys", None)
-    config.pop("api_key", None)
-    _write_config_json(config)
+    if config.get("api_keys") or config.get("api_key"):
+        logging.getLogger(__name__).info(
+            "Found legacy plaintext API key(s) in config.json but skipping "
+            "automatic migration now that keys are per-account. Run the "
+            "documented per-account key migration instead."
+        )
 
 
 # Mirror of llm._PROVIDER_KEY_MAP, duplicated to avoid importing llm.py (which
@@ -165,35 +155,17 @@ _LEGACY_PROVIDER_KEY_MAP: dict[str, str] = {
 
 
 def _get_llm_api_key_with_fallback() -> str:
-    """Get LLM API key with fallback to config file.
+    """Get LLM API key from the environment only.
 
-    Priority: Environment variable > config.json > empty string
+    This helper backs ``Settings.get_effective_api_key()``, which has no
+    request context and therefore no ``user_id`` — it can no longer fall
+    back to the per-account encrypted key store (see
+    ``app.llm.get_llm_config(user_id)`` / ``resolve_api_key`` for the
+    request-scoped, per-account resolution path actually used at runtime).
     """
     import os
 
-    # First check environment variable
-    env_key = os.environ.get("LLM_API_KEY", "")
-    if env_key:
-        return env_key
-
-    # Fallback to config file based on provider
-    config_keys = get_api_keys_from_config()
-    provider = os.environ.get("LLM_PROVIDER", "openai")
-
-    # Map provider to config key
-    provider_map = {
-        "openai": "openai",
-        "azure_foundry": "azure_foundry",
-        "anthropic": "anthropic",
-        "gemini": "google",
-        "openrouter": "openrouter",
-        "deepseek": "deepseek",
-        "groq": "groq",
-        "ollama": "ollama",
-    }
-
-    config_provider = provider_map.get(provider, provider)
-    return config_keys.get(config_provider, "")
+    return os.environ.get("LLM_API_KEY", "")
 
 
 class Settings(BaseSettings):
@@ -318,8 +290,60 @@ class Settings(BaseSettings):
 
     @property
     def sqlite_path(self) -> Path:
-        """Path to the SQLite database file (primary data store)."""
+        """Path to the legacy SQLite database file (pre-Supabase migration source only)."""
         return self.data_dir / "resume_matcher.db"
+
+    # -- Supabase Auth + Postgres --------------------------------------------
+    # DATABASE_URL is a direct Postgres connection string using the
+    # `authenticated` role (NOT the service_role/superuser). It must be async
+    # (postgresql+asyncpg://...); the sync variant is derived automatically
+    # for the api_keys hot path. Never point this at a service-role/superuser
+    # connection — the app relies on RLS being enforced for this role.
+    database_url: str = ""
+
+    @property
+    def async_database_url(self) -> str:
+        """Async (asyncpg) DSN, normalized to the asyncpg SQLAlchemy driver."""
+        url = self.database_url
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://") :]
+        if url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://") :]
+        return url
+
+    @property
+    def sync_database_url(self) -> str:
+        """Sync (psycopg2) DSN, normalized to the psycopg2 SQLAlchemy driver."""
+        url = self.database_url
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://") :]
+        if url.startswith("postgresql+asyncpg://"):
+            url = "postgresql+psycopg2://" + url[len("postgresql+asyncpg://") :]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+psycopg2://" + url[len("postgresql://") :]
+        return url
+
+    # Supabase project URL, e.g. https://<project-ref>.supabase.co
+    supabase_url: str = ""
+    # Publishable (anon) client key — safe to ship to the browser. Never put
+    # the service_role key in any setting the app reads at request time.
+    supabase_publishable_key: str = ""
+    # JWKS endpoint used to verify Supabase Auth access tokens (asymmetric
+    # signing, the current Supabase default). Derived from supabase_url when
+    # left blank.
+    supabase_jwks_url: str = ""
+
+    @property
+    def effective_jwks_url(self) -> str:
+        if self.supabase_jwks_url:
+            return self.supabase_jwks_url
+        base = self.supabase_url.strip().rstrip("/")
+        return f"{base}/auth/v1/.well-known/jwks.json" if base else ""
+
+    # Legacy HS256 shared secret, only needed for older Supabase projects that
+    # still sign access tokens symmetrically. Optional; asymmetric JWKS
+    # verification is preferred and does not need this.
+    supabase_jwt_secret: str = ""
 
     @property
     def config_path(self) -> Path:
