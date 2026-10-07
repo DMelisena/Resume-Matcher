@@ -4,11 +4,19 @@ import { NextRequest } from 'next/server';
 // Resolved per-test via `mockUser`; mirrors the shape middleware reads off
 // `supabase.auth.getUser()`.
 let mockUser: { id: string } | null = null;
+// When set, simulates @supabase/ssr refreshing the session during getUser()
+// by invoking the `setAll` callback middleware registered with the client.
+let mockRefreshedCookie: { name: string; value: string } | null = null;
 
 vi.mock('@supabase/ssr', () => ({
-  createServerClient: () => ({
+  createServerClient: (_url: string, _key: string, options: any) => ({
     auth: {
-      getUser: async () => ({ data: { user: mockUser } }),
+      getUser: async () => {
+        if (mockRefreshedCookie) {
+          options.cookies.setAll([{ ...mockRefreshedCookie, options: {} }]);
+        }
+        return { data: { user: mockUser } };
+      },
     },
   }),
 }));
@@ -28,6 +36,7 @@ function makeRequest(pathname: string): NextRequest {
 describe('middleware auth routing', () => {
   beforeEach(() => {
     mockUser = null;
+    mockRefreshedCookie = null;
   });
 
   it('redirects an authenticated visitor hitting / straight to /dashboard', async () => {
@@ -68,5 +77,35 @@ describe('middleware auth routing', () => {
 
     expect(response.status).toBe(307);
     expect(new URL(response.headers.get('location')!).pathname).toBe('/dashboard');
+  });
+
+  it('redirects an authenticated visitor away from /login/ (trailing slash) to /dashboard', async () => {
+    mockUser = { id: 'user-1' };
+    const response = await middleware(makeRequest('/login/'));
+
+    expect(response.status).toBe(307);
+    // NextURL re-appends a trailing slash on clone+reassign when the source
+    // pathname had one; either form is a successful redirect away from login.
+    expect(new URL(response.headers.get('location')!).pathname).toMatch(/^\/dashboard\/?$/);
+  });
+
+  it('carries a session cookie refreshed mid-request through the /dashboard redirect', async () => {
+    mockUser = { id: 'user-1' };
+    mockRefreshedCookie = { name: 'sb-access-token', value: 'rotated-token' };
+    const response = await middleware(makeRequest('/'));
+
+    expect(response.status).toBe(307);
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/dashboard');
+    expect(response.cookies.get('sb-access-token')?.value).toBe('rotated-token');
+  });
+
+  it('carries a session cookie refreshed mid-request through the /login redirect', async () => {
+    mockUser = null;
+    mockRefreshedCookie = { name: 'sb-access-token', value: 'rotated-token' };
+    const response = await middleware(makeRequest('/dashboard'));
+
+    expect(response.status).toBe(307);
+    expect(new URL(response.headers.get('location')!).pathname).toBe('/login');
+    expect(response.cookies.get('sb-access-token')?.value).toBe('rotated-token');
   });
 });
