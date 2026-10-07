@@ -13,7 +13,10 @@ function isPublicPath(pathname: string): boolean {
   if (PUBLIC_PATHS.some((path) => pathname === path || pathname.startsWith(`${path}/`))) {
     return true;
   }
-  // Landing page and print-only PDF-render routes are not account-scoped UI.
+  // Landing page is public for signed-out visitors; print-only PDF-render
+  // routes are not account-scoped UI. A signed-in user hitting '/' is
+  // redirected straight to /dashboard below instead of seeing the landing
+  // page, so this only governs *unauthenticated* access.
   if (pathname === '/') return true;
   if (pathname.startsWith('/print/')) return true;
   return false;
@@ -54,7 +57,7 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(redirectUrl);
   }
 
-  if (user && (pathname === '/login' || pathname === '/signup')) {
+  if (user && (pathname === '/login' || pathname === '/signup' || pathname === '/')) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = '/dashboard';
     redirectUrl.search = '';
