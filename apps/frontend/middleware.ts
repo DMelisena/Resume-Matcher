@@ -9,10 +9,12 @@ import { SUPABASE_PUBLISHABLE_KEY, SUPABASE_URL } from '@/lib/supabase/env';
 // without a session.
 const PUBLIC_PATHS = ['/login', '/signup'];
 
+function isAuthPath(pathname: string): boolean {
+  return PUBLIC_PATHS.some((path) => pathname === path || pathname.startsWith(`${path}/`));
+}
+
 function isPublicPath(pathname: string): boolean {
-  if (PUBLIC_PATHS.some((path) => pathname === path || pathname.startsWith(`${path}/`))) {
-    return true;
-  }
+  if (isAuthPath(pathname)) return true;
   // Landing page is public for signed-out visitors; print-only PDF-render
   // routes are not account-scoped UI. A signed-in user hitting '/' is
   // redirected straight to /dashboard below instead of seeing the landing
@@ -20,6 +22,17 @@ function isPublicPath(pathname: string): boolean {
   if (pathname === '/') return true;
   if (pathname.startsWith('/print/')) return true;
   return false;
+}
+
+function redirectPreservingCookies(request: NextRequest, response: NextResponse, pathname: string) {
+  const redirectUrl = request.nextUrl.clone();
+  redirectUrl.pathname = pathname;
+  redirectUrl.search = '';
+  const redirectResponse = NextResponse.redirect(redirectUrl);
+  for (const cookie of response.cookies.getAll()) {
+    redirectResponse.cookies.set(cookie);
+  }
+  return redirectResponse;
 }
 
 export async function middleware(request: NextRequest) {
@@ -54,14 +67,15 @@ export async function middleware(request: NextRequest) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = '/login';
     redirectUrl.searchParams.set('next', pathname);
-    return NextResponse.redirect(redirectUrl);
+    const redirectResponse = NextResponse.redirect(redirectUrl);
+    for (const cookie of response.cookies.getAll()) {
+      redirectResponse.cookies.set(cookie);
+    }
+    return redirectResponse;
   }
 
-  if (user && (pathname === '/login' || pathname === '/signup' || pathname === '/')) {
-    const redirectUrl = request.nextUrl.clone();
-    redirectUrl.pathname = '/dashboard';
-    redirectUrl.search = '';
-    return NextResponse.redirect(redirectUrl);
+  if (user && (isAuthPath(pathname) || pathname === '/')) {
+    return redirectPreservingCookies(request, response, '/dashboard');
   }
 
   return response;
