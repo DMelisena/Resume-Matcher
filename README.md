@@ -264,7 +264,7 @@ Endpoints:
 |-----------|------------|
 | Backend | FastAPI, Python 3.13+, LiteLLM |
 | Frontend | Next.js 16, React 19, TypeScript |
-| Database | TinyDB (JSON file storage) |
+| Database | Postgres via Supabase (Row-Level Security, per-account isolation) |
 | Styling | Tailwind CSS 4, Swiss International Style |
 | PDF | Headless Chromium via Playwright |
 

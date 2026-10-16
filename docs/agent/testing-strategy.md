@@ -137,7 +137,7 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 - ⬜ (Optional, future) a Node-based `tsc`/`next build` check — deferred due to nvm-in-hook fragility; the pure-Python locale-parity guard already covers the known i18n break.
 
 **Phase 7 — SQLite persistence + tracker + encrypted-keys coverage (PRs #841 + #843 → `main`) ✅ COMPLETE**
-- ✅ The persistence layer moved from TinyDB to **SQLite (async SQLAlchemy)**; the `conftest.py::isolated_db` fixture now swaps a disposable **temp-file SQLite** DB (not TinyDB) across all router modules, and `tests/unit/test_database.py` exercises **real SQLite CRUD** (incl. `TestApplications`).
+- ✅ The persistence layer moved from TinyDB to **SQLite (async SQLAlchemy)**; the `conftest.py::isolated_db` fixture swapped a disposable **temp-file SQLite** DB (not TinyDB) across all router modules, and `tests/unit/test_database.py` exercised **real SQLite CRUD** (incl. `TestApplications`). *(Superseded — the Supabase Auth + Postgres RLS migration moved `isolated_db` off SQLite onto a real local Postgres instance; see [`supabase-auth-migration.md`](features/supabase-auth-migration.md#local-development).)*
 - ✅ New tracker coverage: `tests/integration/test_applications_api.py` (CRUD, column grouping, detail tolerance for a deleted resume, bulk move/delete) and `tests/integration/test_tracker_autocreate.py` (confirming a tailoring auto-creates an `applied` card).
 - ✅ Encrypted per-provider API keys: `tests/unit/test_crypto.py` (Fernet encrypt/decrypt round-trip + masking).
 - ✅ `/status` graceful degradation (#843): `tests/integration/test_health_api.py` expanded — each check isolated, so a single failing probe yields 200 with partial/degraded state instead of 500.
