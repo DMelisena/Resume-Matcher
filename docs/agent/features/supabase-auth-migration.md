@@ -30,8 +30,15 @@ for a test that proves RLS holds even when a query "forgets" the filter).
   - `middleware.ts` — refreshes the Supabase session cookie and redirects
     unauthenticated visitors to `/login` for every route except the landing
     page, `/login`, `/signup`, and `/print/*` (server-rendered for PDF
-    capture, not account-scoped UI).
+    capture, not account-scoped UI). Signed-in users hitting `/`, `/login`,
+    or `/signup` (with or without a trailing slash) are redirected straight
+    to `/dashboard`; both redirect branches copy cookies from the response
+    `supabase.auth.getUser()` may have refreshed, so a session rotated on
+    the same request isn't lost.
   - `app/login/`, `app/signup/` — Swiss-styled email/password forms.
+  - `components/common/account-bar.tsx` — persistent auth-state indicator
+    rendered in the `(default)` layout on every page: signed-out visitors
+    see "Log in", signed-in users see their email + "Sign out".
 - **Backend** (`apps/backend`) verifies that token on every request via
   `app/auth.py::get_current_user_id` (a FastAPI dependency), preferring
   Supabase's JWKS endpoint (asymmetric signing) with an optional

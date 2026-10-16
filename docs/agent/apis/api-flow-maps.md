@@ -90,7 +90,7 @@ GET /api/v1/config/api-keys
 
 POST /api/v1/config/api-keys
 ├── For each provided provider key:
-│   └── Fernet-encrypt → upsert into SQLite `api_keys` table   # other providers' keys untouched
+│   └── Fernet-encrypt → upsert into Postgres `api_keys` table   # other providers' keys untouched
 └── Return {message, updated_providers}
 
 DELETE /api/v1/config/api-keys/{provider}      # remove one provider's key

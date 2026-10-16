@@ -1,23 +1,24 @@
 # Backend Architecture
 
-> FastAPI + Python 3.13+ | SQLite (SQLAlchemy 2.0 async + aiosqlite) | LiteLLM multi-provider
+> FastAPI + Python 3.13+ | Postgres via Supabase (SQLAlchemy 2.0 async + asyncpg) | LiteLLM multi-provider
 
 ## Directory Structure
 
 ```
 apps/backend/app/
-├── main.py              # FastAPI entry point (lifespan: TinyDB→SQLite import, legacy-key fold-in)
+├── main.py              # FastAPI entry point (lifespan: legacy-key fold-in)
 ├── config.py            # Pydantic settings; encrypted API-key read/write
 ├── crypto.py            # Fernet encrypt/decrypt for API keys at rest
-├── database.py          # Async SQLAlchemy/SQLite facade (returns plain dicts)
+├── auth.py              # Supabase bearer-token verification (get_current_user_id)
+├── database.py          # Async SQLAlchemy/Postgres facade (returns plain dicts)
 ├── models.py            # SQLAlchemy declarative Base + ORM models
-├── db_engine.py         # SQLite engine/session factories (async + sync) + PRAGMAs
+├── db_engine.py         # Postgres engine/session factories (async + sync)
 ├── llm.py               # LiteLLM multi-provider
 ├── pdf.py               # Playwright PDF rendering
-├── routers/             # API endpoints (health, config, resumes, jobs, applications, enrichment)
+├── routers/             # API endpoints (health, config, resumes, jobs, applications, enrichment, auth)
 ├── services/            # parser.py, improver.py, cover_letter.py
 ├── schemas/             # Pydantic models (models.py, applications.py)
-├── scripts/             # migrate_tinydb_to_sqlite.py (one-time importer)
+├── scripts/             # migrate_sqlite_to_supabase.py (one-time per-account backfill)
 └── prompts/templates.py # LLM prompts
 ```
 
@@ -66,50 +67,11 @@ apps/backend/app/
 
 ## Database (`database.py`, `models.py`, `db_engine.py`)
 
-**SQLite** via SQLAlchemy 2.0 async (`aiosqlite`). DB file: `data/resume_matcher.db`.
-`database.py` is an async `Database` facade (global `db` singleton) — same method
-names/signatures as before, but it returns **plain dicts**, never ORM rows.
-ORM models live in `models.py` (declarative `Base` + `Resume`/`Job`/`Improvement`/`Application`/`ApiKey`);
-engine/session plumbing lives in `db_engine.py`.
-
-Tables: `resumes`, `jobs`, `improvements`, `applications`, `api_keys` (encrypted).
-
-```python
-await db.create_resume(content, content_type, filename, is_master, processed_data)
-await db.get_resume(resume_id) → dict | None
-await db.update_resume(resume_id, updates) → dict
-await db.delete_resume(resume_id) → bool
-await db.set_master_resume(resume_id)            # Exactly one master allowed
-await db.create_application(...) / list_applications / update_application / bulk_*
-await db.get_stats() → {total_resumes, total_jobs, total_improvements, total_applications}
-get_api_key_ciphertexts() / replace_api_keys(...)  # sync; encrypted api_keys table
-```
-
-**Two engines, one file (`db_engine.py`):** a module-level **async** engine serves
-the document tables + `applications`; a **sync** engine serves the encrypted
-`api_keys` table, which is read on the synchronous LLM hot path
-(`get_llm_config` → `load_config_file` → `resolve_api_key`) so async isn't threaded
-through `llm.py`. Both apply PRAGMAs `journal_mode=WAL`, `foreign_keys=ON`,
-`busy_timeout` on connect.
-
-**Single-master invariant** is preserved by an `asyncio.Lock`
-(`create_resume_atomic_master`) plus a partial unique index on `is_master`.
-**Jobs' dynamic pipeline fields** (`preview_hash`/`preview_hashes`, `job_keywords`,
-`company`/`role`) are stored in a `metadata_json` JSON column and flattened on read.
-`Application` dedupes on `(job_id, resume_id)` via a `UniqueConstraint`.
-
-### Migration & encrypted keys
-
-- **One-time importer** (`app/scripts/migrate_tinydb_to_sqlite.py`): runs on lifespan
-  startup. If a legacy `data/database.json` (TinyDB) exists and SQLite is empty, it
-  imports the rows, then renames the file `database.json.migrated` (rollback artifact).
-  Idempotent: skips if SQLite already has rows.
-- **Encrypted API keys** (`app/crypto.py`): Fernet symmetric encrypt/decrypt. The
-  secret lives at `data/.secret_key` (auto-generated, `chmod 600`, gitignored, atomic
-  write); plaintext exists only in memory. Per-provider ciphertexts live in the
-  `api_keys` table. `app/config.py` reads/writes them (atomic `replace_api_keys`);
-  `migrate_legacy_keys()` folds any legacy plaintext keys into the encrypted store on
-  startup (idempotent, non-clobbering).
+Postgres via Supabase, per-account Row-Level Security. For the engine/session plumbing,
+tables, invariants, encrypted-key storage, and legacy-data migration, see
+[`backend-guide.md`](backend-guide.md#database-operations) (day-to-day facade usage) and
+[`supabase-auth-migration.md`](../features/supabase-auth-migration.md) (the authoritative
+RLS/auth architecture) — not duplicated here to avoid drift.
 
 ## LLM Integration (`llm.py`)
 
@@ -174,9 +136,9 @@ FRONTEND_BASE_URL=http://localhost:3000
 
 Non-secret config (provider/model/base/features) stored in `data/config.json`, takes
 precedence over env vars. **API keys are never written to `config.json`** — they live
-encrypted in the SQLite `api_keys` table (per-provider) and are injected into the config
-dict only at read time. Set them via `POST /config/api-keys`; `PUT /config/llm-api-key` no
-longer persists a key.
+encrypted in the Postgres `api_keys` table (per-provider, per-account) and are injected
+into the config dict only at read time. Set them via `POST /config/api-keys`; `PUT
+/config/llm-api-key` no longer persists a key.
 
 ## Error Handling
 

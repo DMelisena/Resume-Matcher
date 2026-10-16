@@ -34,7 +34,7 @@ default to `applied` but can be created as `saved`.
 
 ## Data Model
 
-`Application` (SQLite, `apps/backend/app/models.py`): `application_id` (PK),
+`Application` (Postgres, `apps/backend/app/models.py`): `application_id` (PK),
 `job_id`, `resume_id` (the applied/tailored resume), `master_resume_id`
 (optional base — powers the "shared resume" badge), `status` (7-key enum),
 `company`, `role`, `applied_at`, `notes`, `position` (per-column order,

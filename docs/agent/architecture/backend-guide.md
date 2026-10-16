@@ -7,7 +7,7 @@
 | Component | Technology |
 |-----------|------------|
 | Framework | FastAPI |
-| Database | SQLite (SQLAlchemy 2.0 async + aiosqlite) |
+| Database | Postgres via Supabase (SQLAlchemy 2.0 async + asyncpg), per-account RLS — see [`supabase-auth-migration.md`](../features/supabase-auth-migration.md) |
 | AI | LiteLLM (100+ providers) |
 | Doc Parsing | markitdown |
 | Validation | Pydantic |
@@ -17,17 +17,18 @@
 
 ```
 apps/backend/app/
-├── main.py         # Entry point (lifespan: TinyDB→SQLite import, legacy-key fold-in)
+├── main.py         # Entry point (lifespan: legacy-key fold-in)
 ├── config.py       # Settings from env/file; encrypted API-key read/write
 ├── crypto.py       # Fernet encrypt/decrypt for API keys at rest
-├── database.py     # Async SQLAlchemy/SQLite facade (returns plain dicts)
+├── auth.py         # Supabase bearer-token verification (get_current_user_id)
+├── database.py     # Async SQLAlchemy/Postgres facade (returns plain dicts)
 ├── models.py       # SQLAlchemy declarative Base + ORM models
-├── db_engine.py    # SQLite engine/session factories (async + sync) + PRAGMAs
+├── db_engine.py    # Postgres engine/session factories (async + sync)
 ├── llm.py          # Multi-provider LLM
-├── routers/        # health, config, resumes, jobs, applications, enrichment
+├── routers/        # health, config, resumes, jobs, applications, enrichment, auth
 ├── services/       # parser, improver, cover_letter
 ├── schemas/        # Pydantic models (models.py, applications.py)
-├── scripts/        # migrate_tinydb_to_sqlite.py (one-time importer)
+├── scripts/        # migrate_sqlite_to_supabase.py (one-time per-account backfill)
 └── prompts/        # templates.py
 ```
 
@@ -49,27 +50,28 @@ await db.create_application(...) / list_applications / bulk_update_applications
 get_api_key_ciphertexts() / replace_api_keys(...)  # sync; encrypted api_keys table
 ```
 
-**Tables:** `resumes`, `jobs`, `improvements`, `applications`, `api_keys` (encrypted).
-DB file: `data/resume_matcher.db`.
+**Tables:** `resumes`, `jobs`, `improvements`, `applications`, `api_keys` (encrypted), each
+`user_id`-scoped with Postgres RLS policies. Connection, engine plumbing (async + sync, one
+per `Database` instance), and the RLS/role model are described in
+[`supabase-auth-migration.md`](../features/supabase-auth-migration.md) — that is the
+authoritative doc for this layer; don't duplicate it here. The single-master invariant is
+held by an `asyncio.Lock` plus a partial unique index, now per account. Jobs' dynamic
+pipeline fields (`preview_hash(es)`, `job_keywords`, `company`/`role`) live in a
+`metadata_json` JSON column, flattened on read.
 
-**Two engines, one file:** a module-level **async** engine serves the document tables +
-`applications`; a **sync** engine serves the encrypted `api_keys` table (read on the
-synchronous LLM hot path). Both apply PRAGMAs `journal_mode=WAL`, `foreign_keys=ON`,
-`busy_timeout`. The single-master invariant is held by an `asyncio.Lock` plus a partial
-unique index. Jobs' dynamic pipeline fields (`preview_hash(es)`, `job_keywords`,
-`company`/`role`) live in a `metadata_json` JSON column, flattened on read.
+### Encrypted API keys & legacy data migration
 
-### Encrypted API keys & migration
-
-- **Keys** (`crypto.py`): Fernet-encrypted, per-provider, in the `api_keys` table. Secret
-  at `data/.secret_key` (`chmod 600`, gitignored, atomic write; plaintext only in memory).
-  `config.py` injects decrypted keys at read time and strips them on save, so secrets
-  never reach `config.json`. Set via `POST /config/api-keys`; `PUT /config/llm-api-key` no
-  longer persists a key.
-- **Migration** (`scripts/migrate_tinydb_to_sqlite.py`): runs on lifespan startup. Imports
-  a legacy `data/database.json` (TinyDB) into SQLite if present, then renames it
-  `database.json.migrated`. Idempotent. `migrate_legacy_keys()` likewise folds legacy
-  plaintext keys into the encrypted store.
+- **Keys** (`crypto.py`): Fernet-encrypted, per-provider, per-account, in the `api_keys`
+  table. Secret at `data/.secret_key` (`chmod 600`, gitignored, atomic write; plaintext
+  only in memory). `config.py` injects decrypted keys at read time and strips them on
+  save, so secrets never reach `config.json`. Set via `POST /config/api-keys`; `PUT
+  /config/llm-api-key` no longer persists a key.
+- **Legacy single-tenant data**: `scripts/migrate_sqlite_to_supabase.py` back-fills a
+  pre-migration `data/resume_matcher.db` (SQLite) into Postgres for one chosen account;
+  it no longer runs automatically on startup — see
+  [`supabase-auth-migration.md`](../features/supabase-auth-migration.md#deployment-requirements).
+  `migrate_legacy_keys()` still runs on lifespan startup and folds any legacy plaintext
+  keys into the encrypted store (now a safe no-op post-migration).
 
 ## LLM Features
 
@@ -102,7 +104,7 @@ GET  /api/v1/applications        # Kanban tracker: grouped list (+ POST/PATCH/DE
 
 ## Data Flow
 
-**Upload:** File → markitdown → Markdown → LLM parse → JSON → SQLite (via `db`)
+**Upload:** File → markitdown → Markdown → LLM parse → JSON → Postgres (via `db`)
 
 **Improve:** Resume + Job → Extract keywords (LLM) → Tailor (LLM) → Store. Routers call
 services; services call `app/llm.py`; persistence goes through the async `db` facade.
