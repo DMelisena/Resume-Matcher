@@ -8,8 +8,14 @@ let mockUser: { id: string } | null = null;
 // by invoking the `setAll` callback middleware registered with the client.
 let mockRefreshedCookie: { name: string; value: string } | null = null;
 
+interface MockServerClientOptions {
+  cookies: {
+    setAll: (cookies: Array<{ name: string; value: string; options: unknown }>) => void;
+  };
+}
+
 vi.mock('@supabase/ssr', () => ({
-  createServerClient: (_url: string, _key: string, options: any) => ({
+  createServerClient: (_url: string, _key: string, options: MockServerClientOptions) => ({
     auth: {
       getUser: async () => {
         if (mockRefreshedCookie) {
