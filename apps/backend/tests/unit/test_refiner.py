@@ -11,7 +11,11 @@ from app.services.refiner import (
     remove_ai_phrases,
     validate_master_alignment,
 )
+from app.llm import LLMConfig
 from app.schemas.refinement import AlignmentViolation, RefinementConfig
+
+
+FAKE_CONFIG = LLMConfig(provider="openai", model="gpt-test", api_key="sk-test")
 
 
 class TestRemoveAiPhrases:
@@ -109,6 +113,7 @@ class TestValidateMasterAlignment:
         tailored = copy.deepcopy(sample_resume)
         tailored["additional"]["technicalSkills"].append("CI/CD")
         result = await refine_resume(
+            llm_config=FAKE_CONFIG,
             initial_tailored=tailored,
             master_resume=master_resume,
             job_description="Familiarity with CI/CD pipelines and agile practices",
@@ -133,6 +138,7 @@ class TestValidateMasterAlignment:
         tailored = copy.deepcopy(sample_resume)
         tailored["additional"]["technicalSkills"].append("Kubernetes")
         result = await refine_resume(
+            llm_config=FAKE_CONFIG,
             initial_tailored=tailored,
             master_resume=master_resume,
             job_description="Experience with Kubernetes is required.",
@@ -166,6 +172,7 @@ class TestValidateMasterAlignment:
         tailored = copy.deepcopy(sample_resume)
         tailored["additional"]["technicalSkills"].append(skill)
         result = await refine_resume(
+            llm_config=FAKE_CONFIG,
             initial_tailored=tailored,
             master_resume=master_resume,
             job_description=job_description,

@@ -7,8 +7,11 @@ from uuid import uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.auth import get_current_user_id
 from app.main import app
 from app.schemas import InterviewPrepData
+
+TEST_USER_ID = str(uuid4())
 
 
 SAMPLE_INTERVIEW_PREP = {
@@ -40,8 +43,12 @@ SAMPLE_INTERVIEW_PREP = {
 
 @pytest.fixture
 def client():
+    app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
     transport = ASGITransport(app=app)
-    return AsyncClient(transport=transport, base_url="http://test")
+    try:
+        yield AsyncClient(transport=transport, base_url="http://test")
+    finally:
+        app.dependency_overrides.pop(get_current_user_id, None)
 
 
 @pytest.fixture
@@ -220,8 +227,8 @@ class TestGenerateInterviewPrep:
         assert data["interview_prep"]["role_fit_analysis"] == SAMPLE_INTERVIEW_PREP[
             "role_fit_analysis"
         ]
-        mock_generate.assert_awaited_once_with(sample_resume, "Need FastAPI", "en")
-        update_payload = mock_db.update_resume.await_args.args[1]
+        mock_generate.assert_awaited_once_with(TEST_USER_ID, sample_resume, "Need FastAPI", "en")
+        update_payload = mock_db.update_resume.await_args.args[2]
         saved_payload = json.loads(update_payload["interview_prep"])
         assert saved_payload == SAMPLE_INTERVIEW_PREP
 

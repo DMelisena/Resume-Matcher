@@ -3,9 +3,11 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.auth import get_current_user_id
 from app.database import db
+from app.llm import LLMConfig, get_llm_config
 from app.services.improver import extract_job_keywords
 from app.schemas import (
     APPLICATION_STATUS_ORDER,
@@ -42,10 +44,12 @@ def _group_by_status(applications: list[dict[str, Any]]) -> dict[str, list[Appli
 
 
 @router.get("", response_model=ApplicationListResponse)
-async def list_applications() -> ApplicationListResponse:
-    """List all applications grouped by status column."""
+async def list_applications(
+    user_id: str = Depends(get_current_user_id),
+) -> ApplicationListResponse:
+    """List the caller's applications grouped by status column."""
     try:
-        applications = await db.list_applications()
+        applications = await db.list_applications(user_id)
     except Exception as e:
         logger.error("Failed to list applications: %s", e)
         raise HTTPException(status_code=500, detail="Failed to load applications. Please try again.")
@@ -53,7 +57,9 @@ async def list_applications() -> ApplicationListResponse:
 
 
 @router.post("", response_model=ApplicationResponse)
-async def create_application(request: ManualApplicationCreate) -> ApplicationResponse:
+async def create_application(
+    request: ManualApplicationCreate, user_id: str = Depends(get_current_user_id)
+) -> ApplicationResponse:
     """Manually add a card from a pasted job description.
 
     Creates the job, runs a best-effort company/role extraction when not
@@ -61,17 +67,20 @@ async def create_application(request: ManualApplicationCreate) -> ApplicationRes
     just-created job is cleaned up (no orphan jobs / retry drift); caching
     company/role on the job is best-effort and never fails the request.
     """
-    job = await db.create_job(content=request.job_description, resume_id=request.resume_id)
+    job = await db.create_job(
+        user_id=user_id, content=request.job_description, resume_id=request.resume_id
+    )
 
     company = request.company
     role = request.role
     if not company or not role:
-        extracted = await _extract_company_role(request.job_description)
+        extracted = await _extract_company_role(user_id, request.job_description)
         company = company or extracted.get("company")
         role = role or extracted.get("role")
 
     try:
         application = await db.create_application(
+            user_id=user_id,
             job_id=job["job_id"],
             resume_id=request.resume_id,
             status=request.status.value,
@@ -82,7 +91,7 @@ async def create_application(request: ManualApplicationCreate) -> ApplicationRes
     except Exception as e:
         logger.error("Failed to create application: %s", e)
         try:
-            await db.delete_job(job["job_id"])
+            await db.delete_job(user_id, job["job_id"])
         except Exception as cleanup_error:
             logger.warning("Failed to clean up orphan job %s: %s", job["job_id"], cleanup_error)
         raise HTTPException(status_code=500, detail="Failed to create application. Please try again.")
@@ -90,7 +99,7 @@ async def create_application(request: ManualApplicationCreate) -> ApplicationRes
     # Best-effort: cache company/role on the job for later reuse — never 500.
     if company or role:
         try:
-            await db.update_job(job["job_id"], {"company": company, "role": role})
+            await db.update_job(user_id, job["job_id"], {"company": company, "role": role})
         except Exception as e:
             logger.warning("Failed to cache company/role on job %s: %s", job["job_id"], e)
 
@@ -98,22 +107,24 @@ async def create_application(request: ManualApplicationCreate) -> ApplicationRes
 
 
 @router.get("/{application_id}", response_model=ApplicationDetailResponse)
-async def get_application_detail(application_id: str) -> ApplicationDetailResponse:
+async def get_application_detail(
+    application_id: str, user_id: str = Depends(get_current_user_id)
+) -> ApplicationDetailResponse:
     """Get a card with its embedded JD and applied resume (one round-trip).
 
     Tolerates a deleted resume by returning ``resume: null`` rather than 500.
     """
-    application = await db.get_application(application_id)
+    application = await db.get_application(user_id, application_id)
     if application is None:
         raise HTTPException(status_code=404, detail="Application not found")
 
     job_content: str | None = None
     resume: dict[str, Any] | None = None
     try:
-        job = await db.get_job(application["job_id"])
+        job = await db.get_job(user_id, application["job_id"])
         if job:
             job_content = job.get("content")
-        resume = await db.get_resume(application["resume_id"])
+        resume = await db.get_resume(user_id, application["resume_id"])
     except Exception as e:
         # Detail is best-effort beyond the card itself; never 500 the modal.
         logger.warning("Failed to load detail context for %s: %s", application_id, e)
@@ -122,10 +133,14 @@ async def get_application_detail(application_id: str) -> ApplicationDetailRespon
 
 
 @router.patch("/bulk", response_model=ApplicationActionResponse)
-async def bulk_update_applications(request: BulkStatusUpdate) -> ApplicationActionResponse:
-    """Move many cards to one column."""
+async def bulk_update_applications(
+    request: BulkStatusUpdate, user_id: str = Depends(get_current_user_id)
+) -> ApplicationActionResponse:
+    """Move many of the caller's cards to one column."""
     try:
-        moved = await db.bulk_update_applications(request.application_ids, request.status.value)
+        moved = await db.bulk_update_applications(
+            user_id, request.application_ids, request.status.value
+        )
     except Exception as e:
         logger.error("Failed to bulk-update applications: %s", e)
         raise HTTPException(status_code=500, detail="Failed to move applications. Please try again.")
@@ -133,14 +148,18 @@ async def bulk_update_applications(request: BulkStatusUpdate) -> ApplicationActi
 
 
 @router.patch("/{application_id}", response_model=ApplicationResponse)
-async def update_application(application_id: str, request: ApplicationUpdate) -> ApplicationResponse:
+async def update_application(
+    application_id: str,
+    request: ApplicationUpdate,
+    user_id: str = Depends(get_current_user_id),
+) -> ApplicationResponse:
     """Update a card (status/position/notes/company/role/applied_at)."""
     updates = request.model_dump(exclude_unset=True)
     # Normalize the enum to its stable string value for the data layer.
     if "status" in updates and updates["status"] is not None:
         updates["status"] = request.status.value
     try:
-        updated = await db.update_application(application_id, updates)
+        updated = await db.update_application(user_id, application_id, updates)
     except Exception as e:
         logger.error("Failed to update application %s: %s", application_id, e)
         raise HTTPException(status_code=500, detail="Failed to update application. Please try again.")
@@ -150,10 +169,12 @@ async def update_application(application_id: str, request: ApplicationUpdate) ->
 
 
 @router.delete("/{application_id}", response_model=ApplicationActionResponse)
-async def delete_application(application_id: str) -> ApplicationActionResponse:
+async def delete_application(
+    application_id: str, user_id: str = Depends(get_current_user_id)
+) -> ApplicationActionResponse:
     """Delete a card."""
     try:
-        deleted = await db.delete_application(application_id)
+        deleted = await db.delete_application(user_id, application_id)
     except Exception as e:
         logger.error("Failed to delete application %s: %s", application_id, e)
         raise HTTPException(status_code=500, detail="Failed to delete application. Please try again.")
@@ -163,17 +184,19 @@ async def delete_application(application_id: str) -> ApplicationActionResponse:
 
 
 @router.post("/bulk-delete", response_model=ApplicationActionResponse)
-async def bulk_delete_applications(request: BulkDelete) -> ApplicationActionResponse:
-    """Delete many cards."""
+async def bulk_delete_applications(
+    request: BulkDelete, user_id: str = Depends(get_current_user_id)
+) -> ApplicationActionResponse:
+    """Delete many of the caller's cards."""
     try:
-        deleted = await db.bulk_delete_applications(request.application_ids)
+        deleted = await db.bulk_delete_applications(user_id, request.application_ids)
     except Exception as e:
         logger.error("Failed to bulk-delete applications: %s", e)
         raise HTTPException(status_code=500, detail="Failed to delete applications. Please try again.")
     return ApplicationActionResponse(message=f"Deleted {deleted} application(s)", affected=deleted)
 
 
-async def _extract_company_role(job_description: str) -> dict[str, str | None]:
+async def _extract_company_role(user_id: str, job_description: str) -> dict[str, str | None]:
     """Best-effort company/role extraction for the manual-add path.
 
     Reuses the cached keyword-extraction pass; falls back to blank (editable)
@@ -181,7 +204,8 @@ async def _extract_company_role(job_description: str) -> dict[str, str | None]:
     guaranteed to be a string, so values are type-guarded before ``.strip()``.
     """
     try:
-        keywords = await extract_job_keywords(job_description)
+        llm_config: LLMConfig = get_llm_config(user_id)
+        keywords = await extract_job_keywords(llm_config, job_description)
         raw_company = keywords.get("company")
         raw_role = keywords.get("role")
         return {

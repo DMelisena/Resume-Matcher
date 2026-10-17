@@ -8,7 +8,7 @@ from difflib import SequenceMatcher
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from app.llm import complete_json
+from app.llm import LLMConfig, complete_json
 from app.prompts import (
     CRITICAL_TRUTHFULNESS_RULES,
     DEFAULT_IMPROVE_PROMPT_ID,
@@ -504,6 +504,7 @@ def verify_diff_result(
 
 
 async def generate_resume_diffs(
+    config: LLMConfig,
     original_resume: str,
     job_description: str,
     job_keywords: dict[str, Any],
@@ -565,6 +566,7 @@ async def generate_resume_diffs(
 
     result = await complete_json(
         prompt=prompt,
+        config=config,
         system_prompt="You are an expert resume editor. Output only valid JSON with targeted changes.",
         max_tokens=4096,
         schema_type="diff",
@@ -601,10 +603,11 @@ async def generate_resume_diffs(
     return ImproveDiffResult(changes=changes, strategy_notes=strategy_notes)
 
 
-async def extract_job_keywords(job_description: str) -> dict[str, Any]:
+async def extract_job_keywords(config: LLMConfig, job_description: str) -> dict[str, Any]:
     """Extract keywords and requirements from job description.
 
     Args:
+        config: Caller's resolved LLM config (provider/model/API key).
         job_description: Raw job description text
 
     Returns:
@@ -616,6 +619,7 @@ async def extract_job_keywords(job_description: str) -> dict[str, Any]:
 
     return await complete_json(
         prompt=prompt,
+        config=config,
         system_prompt="You are an expert job description analyzer.",
         schema_type="keywords",
     )
@@ -837,6 +841,7 @@ def verify_skill_target_plan(
 
 
 async def generate_skill_target_plan(
+    config: LLMConfig,
     original_resume_data: dict[str, Any],
     job_description: str,
     job_keywords: dict[str, Any],
@@ -858,6 +863,7 @@ async def generate_skill_target_plan(
 
     result = await complete_json(
         prompt=prompt,
+        config=config,
         system_prompt=(
             "You are a resume skill planning agent. Output only valid JSON with "
             "target_skills and strategy_notes."
@@ -908,6 +914,7 @@ def _prepare_skill_targets_for_prompt(
 
 
 async def improve_resume(
+    config: LLMConfig,
     original_resume: str,
     job_description: str,
     job_keywords: dict[str, Any],
@@ -977,6 +984,7 @@ async def improve_resume(
 
     result = await complete_json(
         prompt=prompt,
+        config=config,
         system_prompt="You are an expert resume editor. Output only valid JSON.",
         max_tokens=8192,
     )

@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import { Geist, Noto_Sans_JP, Noto_Sans_KR, Noto_Sans_SC, Space_Grotesk } from 'next/font/google';
 import './(default)/css/globals.css';
+import { AuthProvider } from '@/lib/context/auth-context';
 
 const spaceGrotesk = Space_Grotesk({
   variable: '--font-space-grotesk',
@@ -61,7 +62,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body
         className={`${geist.variable} ${spaceGrotesk.variable} ${notoSansSC.variable} ${notoSansKR.variable} ${notoSansJP.variable} antialiased bg-background text-ink-soft min-h-full`}
       >
-        {children}
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );

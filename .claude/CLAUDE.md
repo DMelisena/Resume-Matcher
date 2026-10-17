@@ -12,7 +12,8 @@ Resume Matcher is an AI-powered application for tailoring resumes to job descrip
 |-------|-------|
 | **Backend** | FastAPI + Python 3.13+, LiteLLM (multi-provider AI) |
 | **Frontend** | Next.js 16 + React 19, Tailwind CSS v4 |
-| **Database** | SQLite (SQLAlchemy 2.0 async / aiosqlite) |
+| **Database** | Postgres via Supabase (SQLAlchemy 2.0 async / asyncpg), per-account Row-Level Security |
+| **Auth** | Supabase Auth (email/password), bearer token verified per-request |
 | **PDF** | Headless Chromium via Playwright |
 
 ---
@@ -67,23 +68,25 @@ apps/
 │   ├── app/
 │   │   ├── main.py          # Entry point
 │   │   ├── config.py        # Environment settings
-│   │   ├── database.py      # Async SQLAlchemy/SQLite facade
+│   │   ├── auth.py          # Supabase bearer-token verification (get_current_user_id)
+│   │   ├── database.py      # Async SQLAlchemy/Postgres (Supabase) facade, per-account RLS
 │   │   ├── models.py        # SQLAlchemy ORM models (Resume/Job/Improvement/Application/ApiKey)
-│   │   ├── db_engine.py     # Async + sync SQLite engines (WAL/FK pragmas)
+│   │   ├── db_engine.py     # Async + sync Postgres engines
 │   │   ├── crypto.py        # Fernet encrypt/decrypt for API keys at rest
 │   │   ├── llm.py           # LiteLLM wrapper
-│   │   ├── routers/         # API endpoints (incl. applications.py = tracker)
+│   │   ├── routers/         # API endpoints (incl. applications.py = tracker, auth.py)
 │   │   ├── services/        # Business logic
 │   │   ├── schemas/         # Pydantic models (incl. applications.py)
 │   │   ├── prompts/         # LLM prompt templates
-│   │   └── scripts/         # One-time TinyDB→SQLite migration (runs on startup)
-│   └── data/                # resume_matcher.db (SQLite) + encrypted API keys + .secret_key
+│   │   └── scripts/         # One-time SQLite→Supabase per-account backfill (manual, not startup)
+│   └── data/                # non-secret config.json, encrypted API keys + .secret_key
 │
 └── frontend/                # Next.js + React
-    ├── app/                 # Pages (dashboard, builder, tailor, tracker, print)
-    ├── components/          # UI components (incl. tracker/)
-    ├── lib/                 # Utilities, API client (incl. api/tracker.ts)
+    ├── app/                 # Pages (login, signup, dashboard, builder, tailor, tracker, print)
+    ├── components/          # UI components (incl. tracker/, common/account-bar.tsx)
+    ├── lib/                 # Utilities, API client, Supabase clients + auth-context (incl. api/tracker.ts)
     ├── hooks/               # Custom React hooks
+    ├── middleware.ts        # Supabase session refresh + route protection
     └── messages/            # i18n translations (en, es, zh, ja, pt)
 ```
 
@@ -113,6 +116,7 @@ apps/
 ### For Features
 | Feature | Documentation |
 |---------|---------------|
+| Auth (Supabase, per-account data + RLS) | [supabase-auth-migration.md](../docs/agent/features/supabase-auth-migration.md) |
 | Application tracker | [application-tracker.md](../docs/agent/features/application-tracker.md) |
 | Custom sections | [custom-sections.md](../docs/agent/features/custom-sections.md) |
 | Resume templates | [resume-templates.md](../docs/agent/features/resume-templates.md) |

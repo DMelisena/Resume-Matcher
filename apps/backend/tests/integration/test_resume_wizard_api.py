@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from httpx import ASGITransport, AsyncClient
 
+from app.auth import get_current_user_id
 from app.main import app
 from app.schemas.resume_wizard import ResumeWizardHistoryEntry, ResumeWizardQuestion
 from app.services.resume_wizard import (
@@ -35,6 +36,7 @@ _AI_RESULT = {
 
 
 async def test_turn_answer_runs_ai_and_returns_next_question(isolated_db) -> None:
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     state = build_initial_wizard_state()
     state.step = "question"
@@ -63,6 +65,7 @@ async def test_turn_answer_runs_ai_and_returns_next_question(isolated_db) -> Non
 
 
 async def test_turn_review_needs_no_llm(isolated_db) -> None:
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     state = build_initial_wizard_state()
     state.step = "question"
@@ -81,6 +84,7 @@ async def test_turn_review_needs_no_llm(isolated_db) -> None:
 
 
 async def test_turn_answer_without_answer_is_422(isolated_db) -> None:
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     state = build_initial_wizard_state()
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -92,6 +96,7 @@ async def test_turn_answer_without_answer_is_422(isolated_db) -> None:
 
 
 async def test_finalize_creates_ready_master_resume(isolated_db) -> None:
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     state = build_initial_wizard_state()
     state.resume_data.personalInfo.name = "James"
@@ -109,7 +114,7 @@ async def test_finalize_creates_ready_master_resume(isolated_db) -> None:
     assert payload["processing_status"] == "ready"
     assert payload["is_master"] is True
 
-    stored = await isolated_db.get_resume(payload["resume_id"])
+    stored = await isolated_db.db.get_resume(isolated_db.user_id, payload["resume_id"])
     assert stored is not None
     assert stored["is_master"] is True
     assert stored["content_type"] == "json"
@@ -117,7 +122,8 @@ async def test_finalize_creates_ready_master_resume(isolated_db) -> None:
 
 
 async def test_finalize_rejects_when_master_exists(isolated_db, sample_resume) -> None:
-    await isolated_db.create_resume(
+    await isolated_db.db.create_resume(
+        isolated_db.user_id,
         content=json.dumps(sample_resume),
         content_type="json",
         filename="existing.json",
@@ -128,6 +134,7 @@ async def test_finalize_rejects_when_master_exists(isolated_db, sample_resume) -
     state = build_initial_wizard_state()
     state.resume_data.personalInfo.name = "James"
 
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
@@ -140,6 +147,7 @@ async def test_finalize_rejects_when_master_exists(isolated_db, sample_resume) -
 
 
 async def test_turn_start_returns_initial_state(isolated_db) -> None:
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     state = build_initial_wizard_state()
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -156,6 +164,7 @@ async def test_turn_start_returns_initial_state(isolated_db) -> None:
 
 
 async def test_turn_back_restores_previous_question(isolated_db) -> None:
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     state = build_initial_wizard_state()
     state.step = "question"
@@ -186,6 +195,7 @@ async def test_turn_back_restores_previous_question(isolated_db) -> None:
 
 
 async def test_turn_skip_advances_without_modifying_resume_data(isolated_db) -> None:
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     state = build_initial_wizard_state()
     state.step = "question"
@@ -216,6 +226,7 @@ async def test_turn_skip_advances_without_modifying_resume_data(isolated_db) -> 
 
 
 async def test_turn_answer_past_cap_routes_to_review_without_llm(isolated_db) -> None:
+    app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
     transport = ASGITransport(app=app)
     state = build_initial_wizard_state()
     state.step = "question"

@@ -13,6 +13,7 @@ import { API_BASE } from '@/lib/api/client';
 import { translate } from '@/lib/i18n/server';
 import { resolveLocale } from '@/lib/i18n/locale';
 import { withLocalizedDefaultSections } from '@/lib/utils/section-helpers';
+import { headers } from 'next/headers';
 
 type PageProps = {
   params: Promise<{ id: string }>;
@@ -77,8 +78,16 @@ function parseBoolean(value: string | undefined, defaultValue: boolean): boolean
 }
 
 async function fetchResumeData(id: string): Promise<ResumeData> {
+  // This is a server-rendered print route: Chromium (via the backend's PDF
+  // renderer) navigates here with no browser session of its own. The
+  // backend forwards the *original* caller's bearer token as a request
+  // header on that navigation (see app/pdf.py::render_resume_pdf) so this
+  // fetch back to the backend stays scoped to whoever asked for the PDF —
+  // never a different account's data.
+  const incomingAuth = (await headers()).get('authorization');
   const res = await fetch(`${API_BASE}/resumes?resume_id=${encodeURIComponent(id)}`, {
     cache: 'no-store',
+    headers: incomingAuth ? { Authorization: incomingAuth } : undefined,
   });
   if (!res.ok) {
     throw new Error(`Failed to load resume (status ${res.status}).`);

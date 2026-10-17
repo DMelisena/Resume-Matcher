@@ -10,7 +10,10 @@ http://localhost:8000/api/v1
 
 ## Authentication
 
-Currently none (local-first design).
+Supabase Auth: every request (except `/health`) must carry
+`Authorization: Bearer <supabase-access-token>`, verified by
+`app/auth.py::get_current_user_id`. See
+[`supabase-auth-migration.md`](../features/supabase-auth-migration.md).
 
 ## Endpoints
 

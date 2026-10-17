@@ -2,8 +2,9 @@
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from app.auth import get_current_user_id
 from app.database import db
 from app.llm import check_llm_health, get_llm_config
 from app.schemas import HealthResponse, StatusResponse
@@ -32,17 +33,18 @@ async def health_check() -> HealthResponse:
 
 
 @router.get("/status", response_model=StatusResponse)
-async def get_status() -> StatusResponse:
-    """Get comprehensive application status.
+async def get_status(user_id: str = Depends(get_current_user_id)) -> StatusResponse:
+    """Get comprehensive application status for the authenticated caller.
 
     Each subsystem check is isolated: a failure in the LLM health probe or the
     database stats query degrades only its own field instead of 500-ing the
     whole endpoint, so the status page can still report partial/degraded state.
+    Stats are scoped to the caller's own account, not a global view.
     """
     llm_configured = False
     llm_healthy = False
     try:
-        config = get_llm_config()
+        config = get_llm_config(user_id)
         # ollama / openai_compatible run without a key, matching check_llm_health.
         llm_configured = bool(config.api_key) or config.provider in ("ollama", "openai_compatible")
         llm_status = await check_llm_health(config)
@@ -52,7 +54,7 @@ async def get_status() -> StatusResponse:
 
     db_stats: dict = dict(_EMPTY_DB_STATS)
     try:
-        db_stats = await db.get_stats()
+        db_stats = await db.get_stats(user_id)
     except Exception:
         logger.exception("Status: database stats failed")
 

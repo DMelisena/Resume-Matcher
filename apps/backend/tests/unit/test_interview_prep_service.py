@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from app.services.interview_prep import generate_interview_prep
 
+FAKE_USER_ID = "d290f1ee-6c54-4b01-90e6-d701748f0851"
 
 SAMPLE_RESUME = {
     "personalInfo": {"name": "Jane Doe"},
@@ -63,12 +64,12 @@ async def test_generate_interview_prep_validates_successful_json():
     ) as mock_complete, _patched_llm_token_helpers() as token_helpers:
         mock_complete.return_value = _valid_payload()
 
-        result = await generate_interview_prep(SAMPLE_RESUME, "Need FastAPI", "en")
+        result = await generate_interview_prep(FAKE_USER_ID, SAMPLE_RESUME, "Need FastAPI", "en")
 
     mock_get_llm_config, mock_get_model_name, mock_get_safe_max_tokens = token_helpers
     assert result.role_fit_analysis == ["Python API experience is relevant."]
     mock_complete.assert_awaited_once()
-    mock_get_llm_config.assert_called_once_with()
+    mock_get_llm_config.assert_called_once_with(FAKE_USER_ID)
     mock_get_model_name.assert_called_once_with(mock_get_llm_config.return_value)
     mock_get_safe_max_tokens.assert_called_once_with(
         "openai/small-output-model",
@@ -91,6 +92,7 @@ async def test_generate_interview_prep_bounds_prompt_inputs():
             "summary": "Backend engineer " + ("with API delivery evidence. " * 3000),
         }
         await generate_interview_prep(
+            FAKE_USER_ID,
             large_resume,
             "Need FastAPI. " + ("Detailed requirement. " * 1500),
             "en",
@@ -113,4 +115,4 @@ async def test_generate_interview_prep_rejects_malformed_llm_json():
         }
 
         with pytest.raises(ValidationError):
-            await generate_interview_prep(SAMPLE_RESUME, "Need FastAPI", "en")
+            await generate_interview_prep(FAKE_USER_ID, SAMPLE_RESUME, "Need FastAPI", "en")

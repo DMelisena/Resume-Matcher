@@ -14,7 +14,7 @@ import re
 from functools import lru_cache
 from typing import Any
 
-from app.llm import complete_json
+from app.llm import LLMConfig, complete_json
 from app.prompts.refinement import (
     AI_PHRASE_BLACKLIST,
     AI_PHRASE_REPLACEMENTS,
@@ -74,6 +74,7 @@ def _extract_jd_skill_keys(
 
 
 async def refine_resume(
+    llm_config: LLMConfig,
     initial_tailored: dict[str, Any],
     master_resume: dict[str, Any],
     job_description: str,
@@ -83,6 +84,7 @@ async def refine_resume(
     """Multi-pass refinement of an initially tailored resume.
 
     Args:
+        llm_config: Caller's resolved LLM config (provider/model/API key)
         initial_tailored: Output from improve_resume() first pass
         master_resume: Original master resume data (source of truth)
         job_description: Raw job description text
@@ -112,6 +114,7 @@ async def refine_resume(
             )
             try:
                 current = await inject_keywords(
+                    llm_config,
                     current,
                     keyword_analysis.injectable_keywords,
                     master_resume,
@@ -522,6 +525,7 @@ def _preserve_description_styles(
 
 
 async def inject_keywords(
+    llm_config: LLMConfig,
     tailored: dict[str, Any],
     keywords_to_inject: list[str],
     master: dict[str, Any],
@@ -530,6 +534,7 @@ async def inject_keywords(
     """Use LLM to inject missing keywords into appropriate sections.
 
     Args:
+        llm_config: Caller's resolved LLM config (provider/model/API key)
         tailored: Current tailored resume
         keywords_to_inject: Keywords that are in master but missing from tailored
         master: Master resume (source of truth)
@@ -559,6 +564,7 @@ async def inject_keywords(
     try:
         result = await complete_json(
             prompt=prompt,
+            config=llm_config,
             system_prompt=(
                 "You are a resume editor. Inject keywords naturally without adding "
                 "fabricated content. Return only valid JSON matching the input schema."

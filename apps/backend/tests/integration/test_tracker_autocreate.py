@@ -12,12 +12,14 @@ from unittest.mock import AsyncMock, patch
 
 from httpx import ASGITransport, AsyncClient
 
+from app.auth import get_current_user_id
 from app.main import app
 from app.schemas.models import ResumeData
 from tests.integration.test_pipeline_e2e import _upload_resume
 
 
-def _new_client():
+def _new_client(user_id):
+    app.dependency_overrides[get_current_user_id] = lambda: user_id
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
@@ -26,7 +28,7 @@ async def _preview_then_confirm(isolated_db, sample_resume):
     upload_resp = await _upload_resume(isolated_db, sample_resume)
     resume_id = upload_resp.json()["resume_id"]
 
-    async with _new_client() as client:
+    async with _new_client(isolated_db.user_id) as client:
         jobs_resp = await client.post(
             "/api/v1/jobs/upload",
             json={"job_descriptions": ["Senior Backend Engineer at Acme Corp: Python, FastAPI."]},
@@ -77,7 +79,7 @@ async def _preview_then_confirm(isolated_db, sample_resume):
             return_value="Senior Backend Engineer - Acme Corp",
         ),
     ):
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             preview_resp = await client.post(
                 "/api/v1/resumes/improve/preview",
                 json={"resume_id": resume_id, "job_id": job_id},
@@ -85,7 +87,7 @@ async def _preview_then_confirm(isolated_db, sample_resume):
         assert preview_resp.status_code == 200, preview_resp.text
         preview_data = preview_resp.json()["data"]
 
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             confirm_resp = await client.post(
                 "/api/v1/resumes/improve/confirm",
                 json={
@@ -104,7 +106,7 @@ class TestTrackerAutoCreate:
     async def test_confirm_creates_applied_card(self, isolated_db, sample_resume):
         resume_id, job_id, tailored_id = await _preview_then_confirm(isolated_db, sample_resume)
 
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             board = (await client.get("/api/v1/applications")).json()["columns"]
 
         applied = board["applied"]
@@ -124,6 +126,6 @@ class TestTrackerAutoCreate:
         await _preview_then_confirm(isolated_db, sample_resume)
         # A second confirm creates a *new* tailored resume id, so it's a distinct
         # card — verify at least the first path produced exactly one so far.
-        async with _new_client() as client:
+        async with _new_client(isolated_db.user_id) as client:
             board = (await client.get("/api/v1/applications")).json()["columns"]
         assert len(board["applied"]) == 1

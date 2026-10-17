@@ -1,17 +1,25 @@
 """Integration tests for configuration endpoints."""
 
 from unittest.mock import patch, AsyncMock
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.auth import get_current_user_id
 from app.main import app
+
+TEST_USER_ID = str(uuid4())
 
 
 @pytest.fixture
 def client():
+    app.dependency_overrides[get_current_user_id] = lambda: TEST_USER_ID
     transport = ASGITransport(app=app)
-    return AsyncClient(transport=transport, base_url="http://test")
+    try:
+        yield AsyncClient(transport=transport, base_url="http://test")
+    finally:
+        app.dependency_overrides.pop(get_current_user_id, None)
 
 
 class TestLlmConfig:
@@ -392,14 +400,23 @@ class TestEncryptedApiKeys:
     """Per-provider keys are encrypted at rest, independent, and never leak."""
 
     @pytest.fixture
-    def keys_env(self, isolated_db, tmp_path, monkeypatch):
-        """Isolate the key store (temp DB), config.json, and crypto secret."""
+    def keys_env(self, isolated_db, client, tmp_path, monkeypatch):
+        """Isolate the key store (real Postgres+RLS), config.json, and crypto secret.
+
+        Depends on `client` (not just `isolated_db`) so it can re-point the
+        auth override at `isolated_db`'s real user_id — otherwise the HTTP
+        requests through `client` would write under the module's fixed
+        TEST_USER_ID while direct `isolated_db.db.*` calls below read/write
+        under a different random id, and every assertion would silently see
+        empty data instead of a real mismatch.
+        """
         from app import crypto
         from app.config import settings
         import app.config as config_module
 
         monkeypatch.setattr(settings, "data_dir", tmp_path)
         monkeypatch.setattr(config_module, "CONFIG_FILE_PATH", tmp_path / "config.json")
+        app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
         crypto.reset_cache()
         yield isolated_db
         crypto.reset_cache()
@@ -418,7 +435,7 @@ class TestEncryptedApiKeys:
     async def test_keys_encrypted_at_rest(self, keys_env, client):
         async with client:
             await client.post("/api/v1/config/api-keys", json={"openai": "sk-plaintext-123"})
-        ciphertexts = keys_env.get_api_key_ciphertexts()
+        ciphertexts = keys_env.db.get_api_key_ciphertexts(keys_env.user_id)
         assert "openai" in ciphertexts
         # Stored value is ciphertext, not the plaintext key.
         assert "sk-plaintext-123" not in ciphertexts["openai"]
@@ -441,7 +458,7 @@ class TestEncryptedApiKeys:
 
         async with client:
             await client.post("/api/v1/config/api-keys", json={"google": "sk-google-key"})
-        stored = load_config_file()
+        stored = load_config_file(keys_env.user_id)
         # The gemini LLM provider maps to the google key-store slot.
         assert resolve_api_key(stored, "gemini") == "sk-google-key"
 
@@ -456,21 +473,32 @@ class TestEncryptedApiKeys:
 
 
 class TestLegacyKeyMigration:
-    """migrate_legacy_keys folds config.json secrets into the encrypted store."""
+    """migrate_legacy_keys is now a safe no-op (Workstream: Supabase Auth).
+
+    The API key store became per-account; this function runs at startup with
+    no request-scoped user, so it can no longer guess which account owns a
+    pre-multi-tenant plaintext key (see app/config.py::migrate_legacy_keys
+    docstring, and the explicit per-account backfill in
+    app/scripts/migrate_sqlite_to_supabase.py). These tests guard that
+    property: legacy plaintext keys are left untouched on disk and never
+    silently attributed to an arbitrary account, rather than the old
+    fold-into-the-global-store behavior.
+    """
 
     @pytest.fixture
-    def keys_env(self, isolated_db, tmp_path, monkeypatch):
+    def keys_env(self, isolated_db, client, tmp_path, monkeypatch):
         from app import crypto
         from app.config import settings
         import app.config as config_module
 
         monkeypatch.setattr(settings, "data_dir", tmp_path)
         monkeypatch.setattr(config_module, "CONFIG_FILE_PATH", tmp_path / "config.json")
+        app.dependency_overrides[get_current_user_id] = lambda: isolated_db.user_id
         crypto.reset_cache()
         yield isolated_db
         crypto.reset_cache()
 
-    async def test_migration_folds_and_clears_legacy_slots(self, keys_env, monkeypatch, tmp_path):
+    async def test_migration_leaves_legacy_slots_untouched(self, keys_env, monkeypatch, tmp_path):
         import json
         import app.config as config_module
         from app.config import migrate_legacy_keys, get_api_keys_from_config
@@ -486,24 +514,26 @@ class TestLegacyKeyMigration:
 
         migrate_legacy_keys()
 
-        keys = get_api_keys_from_config()
-        assert keys["openai"] == "legacy-openai"
-        # The single legacy key is mapped via the active provider (anthropic).
-        assert keys["anthropic"] == "legacy-anthropic-single"
-        # config.json no longer holds the secrets.
+        # No account to attribute the legacy key to, so nothing was folded in.
+        keys = get_api_keys_from_config(keys_env.user_id)
+        assert "openai" not in keys
+        assert "anthropic" not in keys
+        # config.json is left exactly as it was — no silent data loss either.
         on_disk = json.loads(config_module.CONFIG_FILE_PATH.read_text())
-        assert "api_keys" not in on_disk
-        assert "api_key" not in on_disk
-        assert on_disk["model"] == "claude"  # non-secret config preserved
+        assert on_disk["api_keys"] == {"openai": "legacy-openai"}
+        assert on_disk["api_key"] == "legacy-anthropic-single"
+        assert on_disk["model"] == "claude"
 
-    async def test_migration_is_idempotent_and_non_clobbering(self, keys_env, monkeypatch):
+    async def test_migration_does_not_clobber_existing_per_account_keys(self, keys_env, monkeypatch):
         import json
         import app.config as config_module
         from app.config import migrate_legacy_keys, get_api_keys_from_config
 
-        # Pre-existing encrypted key for openai must NOT be clobbered.
+        # A real per-account encrypted key for openai must NOT be touched.
         from app import crypto
-        keys_env.set_api_key_ciphertext("openai", crypto.encrypt("already-stored"))
+        keys_env.db.set_api_key_ciphertext(
+            keys_env.user_id, "openai", crypto.encrypt("already-stored")
+        )
 
         config_module.CONFIG_FILE_PATH.write_text(
             json.dumps({"provider": "openai", "api_keys": {"openai": "legacy-should-not-win"}})
@@ -511,8 +541,8 @@ class TestLegacyKeyMigration:
         migrate_legacy_keys()
         migrate_legacy_keys()  # idempotent second run
 
-        keys = get_api_keys_from_config()
-        assert keys["openai"] == "already-stored"  # not clobbered
+        keys = get_api_keys_from_config(keys_env.user_id)
+        assert keys["openai"] == "already-stored"  # untouched, not clobbered
 
     async def test_migration_noop_without_legacy(self, keys_env):
         import app.config as config_module

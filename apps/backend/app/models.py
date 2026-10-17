@@ -1,15 +1,21 @@
 """SQLAlchemy ORM models for Resume Matcher.
 
-A single declarative ``Base`` backs all tables (doc tables migrated from
-TinyDB plus the new ``applications`` and ``api_keys`` tables). The facade in
+A single declarative ``Base`` backs all tables. The facade in
 ``app/database.py`` converts ORM rows to plain dicts so the rest of the app
 never sees ORM objects — preserving the TinyDB-era contracts.
+
+Every user-owned table carries a ``user_id`` column (the Supabase
+``auth.users.id`` UUID of the owning account). It is enforced at two layers:
+Postgres Row-Level Security policies (see ``supabase/migrations/``) are the
+authoritative boundary; the facade also filters/sets ``user_id`` on every
+query as defense-in-depth so a policy gap never silently leaks data.
 """
 
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -28,11 +34,12 @@ class Base(DeclarativeBase):
 
 
 class Resume(Base):
-    """A resume document (master or tailored)."""
+    """A resume document (master or tailored), owned by one account."""
 
     __tablename__ = "resumes"
 
     resume_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text)
     content_type: Mapped[str] = mapped_column(String, default="md")
     filename: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -52,20 +59,21 @@ class Resume(Base):
     updated_at: Mapped[str] = mapped_column(String, default=_utcnow_iso)
 
     __table_args__ = (
-        # At most one master resume. Partial unique index enforces the invariant
-        # at the storage layer; ``_master_resume_lock`` remains the primary
-        # (race-free) mechanism in the facade.
+        # At most one master resume *per account*. Partial unique index
+        # enforces the invariant at the storage layer; ``_master_resume_lock``
+        # remains the primary (race-free) mechanism in the facade.
         Index(
-            "ux_resumes_single_master",
+            "ux_resumes_single_master_per_user",
+            "user_id",
             "is_master",
             unique=True,
-            sqlite_where=text("is_master = 1"),
+            postgresql_where=text("is_master = true"),
         ),
     )
 
 
 class Job(Base):
-    """A job description.
+    """A job description, owned by one account.
 
     Only the stable columns are first-class; everything the pipeline attaches
     dynamically (``job_keywords``, ``job_keywords_hash``, ``preview_hash``,
@@ -77,6 +85,7 @@ class Job(Base):
     __tablename__ = "jobs"
 
     job_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
     content: Mapped[str] = mapped_column(Text)
     resume_id: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[str] = mapped_column(String, default=_utcnow_iso)
@@ -89,6 +98,7 @@ class Improvement(Base):
     __tablename__ = "improvements"
 
     request_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
     original_resume_id: Mapped[str] = mapped_column(String)
     tailored_resume_id: Mapped[str] = mapped_column(String, index=True)
     job_id: Mapped[str] = mapped_column(String)
@@ -97,16 +107,19 @@ class Improvement(Base):
 
 
 class Application(Base):
-    """A Kanban application-tracker card."""
+    """A Kanban application-tracker card, owned by one account."""
 
     __tablename__ = "applications"
     __table_args__ = (
-        # Concurrency-safe dedupe: a card is unique per (job, applied resume).
+        # Concurrency-safe dedupe: a card is unique per (owner, job, applied resume).
         # The app-level select-then-insert relies on this to collapse races.
-        UniqueConstraint("job_id", "resume_id", name="uq_application_job_resume"),
+        UniqueConstraint(
+            "user_id", "job_id", "resume_id", name="uq_application_user_job_resume"
+        ),
     )
 
     application_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
     job_id: Mapped[str] = mapped_column(String, index=True)
     # The applied/tailored resume shown in the modal and opened by "Edit".
     resume_id: Mapped[str] = mapped_column(String, index=True)
@@ -123,7 +136,7 @@ class Application(Base):
 
 
 class ApiKey(Base):
-    """An encrypted LLM provider API key.
+    """An encrypted LLM provider API key, owned by one account.
 
     ``provider`` is the *key-store* provider name (e.g. ``google`` for the
     ``gemini`` LLM provider, via ``_PROVIDER_KEY_MAP``). Only ciphertext is
@@ -131,7 +144,12 @@ class ApiKey(Base):
     """
 
     __tablename__ = "api_keys"
+    __table_args__ = (
+        UniqueConstraint("user_id", "provider", name="uq_api_keys_user_provider"),
+    )
 
-    provider: Mapped[str] = mapped_column(String, primary_key=True)
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String)
     ciphertext: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[str] = mapped_column(String, default=_utcnow_iso)
