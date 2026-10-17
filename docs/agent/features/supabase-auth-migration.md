@@ -28,13 +28,14 @@ for a test that proves RLS holds even when a query "forgets" the filter).
     raw-fetch upload path in `hooks/use-file-upload.ts`) call to attach
     `Authorization: Bearer <token>` to every backend request.
   - `middleware.ts` — refreshes the Supabase session cookie and redirects
-    unauthenticated visitors to `/login` for every route except the landing
-    page, `/login`, `/signup`, and `/print/*` (server-rendered for PDF
-    capture, not account-scoped UI). Signed-in users hitting `/`, `/login`,
-    or `/signup` (with or without a trailing slash) are redirected straight
-    to `/dashboard`; both redirect branches copy cookies from the response
-    `supabase.auth.getUser()` may have refreshed, so a session rotated on
-    the same request isn't lost.
+    unauthenticated visitors to `/login` for every route except `/login`,
+    `/signup`, and `/print/*` (server-rendered for PDF capture, not
+    account-scoped UI) — the landing page at `/` is never exempt, so
+    signed-out visitors hitting it are redirected to `/login` too. Signed-in
+    users hitting `/`, `/login`, or `/signup` (with or without a trailing
+    slash) are redirected straight to `/dashboard`; both redirect branches
+    copy cookies from the response `supabase.auth.getUser()` may have
+    refreshed, so a session rotated on the same request isn't lost.
   - `app/login/`, `app/signup/` — Swiss-styled email/password forms.
   - `components/common/account-bar.tsx` — persistent auth-state indicator
     rendered in the `(default)` layout on every page: signed-out visitors
