@@ -15,11 +15,10 @@ function isAuthPath(pathname: string): boolean {
 
 function isPublicPath(pathname: string): boolean {
   if (isAuthPath(pathname)) return true;
-  // Landing page is public for signed-out visitors; print-only PDF-render
-  // routes are not account-scoped UI. A signed-in user hitting '/' is
-  // redirected straight to /dashboard below instead of seeing the landing
-  // page, so this only governs *unauthenticated* access.
-  if (pathname === '/') return true;
+  // Print-only PDF-render routes are not account-scoped UI. The root path
+  // is handled separately below: every visitor hitting '/' is redirected,
+  // to /login when signed out or /dashboard when signed in, so the landing
+  // page is never rendered directly.
   if (pathname.startsWith('/print/')) return true;
   return false;
 }
