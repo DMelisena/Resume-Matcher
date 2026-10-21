@@ -1,3 +1,8 @@
+-- Schema + RLS policies for the Supabase Postgres project (auth/session store).
+-- The live app's resumes/jobs/applications data is NOT in these tables: it is
+-- served by the FastAPI backend from its own SQLite database
+-- (apps/backend/app/database.py). These policies do not protect that API —
+-- see "Known limitation" in docs/deployment-auth.md.
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   created_at timestamptz not null default now()
