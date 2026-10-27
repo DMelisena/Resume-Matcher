@@ -53,11 +53,14 @@ describe('middleware auth routing', () => {
     expect(new URL(response.headers.get('location')!).pathname).toBe('/dashboard');
   });
 
-  it('lets an unauthenticated visitor see the landing page at /', async () => {
+  it('redirects an unauthenticated visitor hitting / to /login', async () => {
     mockUser = null;
     const response = await middleware(makeRequest('/'));
 
-    expect(response.status).not.toBe(307);
+    expect(response.status).toBe(307);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.pathname).toBe('/login');
+    expect(location.searchParams.get('next')).toBe('/');
   });
 
   it('redirects an unauthenticated visitor hitting a protected route to /login', async () => {
